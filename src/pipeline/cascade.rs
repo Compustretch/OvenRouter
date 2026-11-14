@@ -54,8 +54,7 @@ impl fmt::Display for Slot {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { write!(f, "{}", self.0) }
 }
 
-/// A precedence constraint contributed by one or more task-owned cascade paths.
-/// The task set preserves the provenance of an edge in the union execution DAG.
+/// A task-path precedence edge in the union graph, together with its owners.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CascadeDependency {
     pub from: TierId,
@@ -97,7 +96,7 @@ impl fmt::Display for CascadeGraphError {
                 )).collect::<Vec<_>>().join("; ");
                 write!(
                     f,
-                    "task cascades create a cycle among tiers: {tiers}; blocked precedence constraints: {dependencies}"
+                    "task cascades contain a cycle among tiers: {tiers}; blocked precedence constraints: {dependencies}"
                 )
             },
         }
@@ -105,15 +104,97 @@ impl fmt::Display for CascadeGraphError {
 }
 impl Error for CascadeGraphError {}
 
-/// The graph owns the concrete TierInstances. Each task path remains a sequence
-/// of TierNames; graph nodes receive hash-derived TierIds only during compilation.
-/// The union graph has one global topological order, and each precedence edge
-/// retains the task paths that introduced it.
+/// Return only nodes that belong to a directed cycle within the candidate set.
+/// Kahn's residual can also contain nodes downstream of a cycle.
+fn cycle_members(
+    successors: &BTreeMap<TierId, BTreeSet<TierId>>,
+    candidates: &BTreeSet<TierId>,
+) -> BTreeSet<TierId> {
+    struct Tarjan<'a> {
+        successors: &'a BTreeMap<TierId, BTreeSet<TierId>>,
+        candidates: &'a BTreeSet<TierId>,
+        next_index: usize,
+        indices: BTreeMap<TierId, usize>,
+        lowlinks: BTreeMap<TierId, usize>,
+        stack: Vec<TierId>,
+        on_stack: BTreeSet<TierId>,
+        cycles: BTreeSet<TierId>,
+    }
+
+    impl<'a> Tarjan<'a> {
+        fn visit(&mut self, node: TierId) {
+            let index = self.next_index;
+            self.next_index += 1;
+            self.indices.insert(node, index);
+            self.lowlinks.insert(node, index);
+            self.stack.push(node);
+            self.on_stack.insert(node);
+
+            let neighbors: Vec<_> = self.successors.get(&node)
+                .into_iter()
+                .flat_map(|next| next.iter().copied())
+                .filter(|next| self.candidates.contains(next))
+                .collect();
+
+            for next in neighbors {
+                if !self.indices.contains_key(&next) {
+                    self.visit(next);
+                    let lowlink = self.lowlinks[&node].min(self.lowlinks[&next]);
+                    self.lowlinks.insert(node, lowlink);
+                } else if self.on_stack.contains(&next) {
+                    let lowlink = self.lowlinks[&node].min(self.indices[&next]);
+                    self.lowlinks.insert(node, lowlink);
+                }
+            }
+
+            if self.lowlinks[&node] == self.indices[&node] {
+                let mut component = Vec::new();
+                loop {
+                    let member = self.stack.pop().expect("Tarjan root must be on the stack");
+                    self.on_stack.remove(&member);
+                    component.push(member);
+                    if member == node {
+                        break;
+                    }
+                }
+
+                let has_self_loop = self.successors.get(&node)
+                    .is_some_and(|next| next.contains(&node));
+                if component.len() > 1 || has_self_loop {
+                    self.cycles.extend(component);
+                }
+            }
+        }
+    }
+
+    let mut tarjan = Tarjan {
+        successors,
+        candidates,
+        next_index: 0,
+        indices: BTreeMap::new(),
+        lowlinks: BTreeMap::new(),
+        stack: Vec::new(),
+        on_stack: BTreeSet::new(),
+        cycles: BTreeSet::new(),
+    };
+
+    for node in candidates.iter().copied().collect::<Vec<_>>() {
+        if !tarjan.indices.contains_key(&node) {
+            tarjan.visit(node);
+        }
+    }
+    tarjan.cycles
+}
+
+/// The compiled graph is the global union of materialized tier instances.
+/// Nodes are shared by name/instance identity. Task paths remain separate ordered
+/// projections over those nodes; their adjacencies are retained as provenance,
+/// rather than treated as global runtime barriers.
 #[derive(Clone, Default)]
 pub struct CascadeGraph {
-    paths: BTreeMap<String, Cascade>,
+    paths: BTreeMap<String, Vec<TierId>>,
+    progression_edges: BTreeMap<(TierId, TierId), BTreeSet<String>>,
     order: Vec<TierId>,
-    dependencies: Vec<CascadeDependency>,
     tasks_by_tier: BTreeMap<TierId, BTreeSet<String>>,
     names_by_id: BTreeMap<TierId, TierName>,
     ids_by_name: BTreeMap<TierName, TierId>,
@@ -126,7 +207,7 @@ impl CascadeGraph {
         registry: &TierRegistry,
     ) -> Result<Self, CascadeGraphError> {
         let mut graph = Self::default();
-        let mut successors: BTreeMap<TierId, BTreeMap<TierId, BTreeSet<String>>> = BTreeMap::new();
+        let mut successors: BTreeMap<TierId, BTreeSet<TierId>> = BTreeMap::new();
         let mut indegree: BTreeMap<TierId, usize> = BTreeMap::new();
         let mut first_seen: BTreeMap<TierId, usize> = BTreeMap::new();
         let mut next_rank = 0usize;
@@ -210,25 +291,17 @@ impl CascadeGraph {
             }
 
             for edge in path_ids.windows(2) {
-                let owners = successors.entry(edge[0]).or_default().entry(edge[1]).or_default();
-                if owners.is_empty() {
-                    *indegree.entry(edge[1]).or_insert(0) += 1;
+                let from = edge[0];
+                let to = edge[1];
+                graph.progression_edges.entry((from, to)).or_default()
+                    .insert(task.name.clone());
+                if successors.entry(from).or_default().insert(to) {
+                    *indegree.entry(to).or_insert(0) += 1;
                 }
-                owners.insert(task.name.clone());
             }
 
-            graph.paths.insert(task.name.clone(), task.cascade.clone());
+            graph.paths.insert(task.name.clone(), path_ids);
         }
-
-        // Materialize the union edges with their task-path provenance. Keep the
-        // ordering relation global; provenance explains which paths require it.
-        graph.dependencies = successors.iter()
-            .flat_map(|(from, next)| next.iter().map(|(to, tasks)| CascadeDependency {
-                from: *from,
-                to: *to,
-                tasks: tasks.clone(),
-            }))
-            .collect();
 
         // Preserve first appearance in task cascades as the deterministic tie-break.
         let mut ready: BTreeSet<(usize, TierId)> = indegree.iter()
@@ -242,7 +315,7 @@ impl CascadeGraph {
         while let Some((_, tier)) = ready.pop_first() {
             order.push(tier);
             if let Some(next) = successors.get(&tier) {
-                for dependent in next.keys() {
+                for dependent in next {
                     let degree = indegree.get_mut(dependent).expect("edge target has indegree");
                     *degree -= 1;
                     if *degree == 0 {
@@ -259,12 +332,14 @@ impl CascadeGraph {
             let blocked: BTreeSet<TierId> = indegree.iter()
                 .filter_map(|(tier, degree)| (*degree > 0).then_some(*tier))
                 .collect();
-            let tiers = blocked.iter().copied().collect();
-            // Kahn's residual graph can include nodes downstream of a cycle,
-            // so report every dependency still blocked by that residual graph.
-            let blocked_dependencies = graph.dependencies.iter()
-                .filter(|edge| blocked.contains(&edge.from) && blocked.contains(&edge.to))
-                .cloned()
+            let tiers = cycle_members(&successors, &blocked).into_iter().collect();
+            let blocked_dependencies = graph.progression_edges.iter()
+                .filter(|((from, to), _)| blocked.contains(from) && blocked.contains(to))
+                .map(|((from, to), tasks)| CascadeDependency {
+                    from: *from,
+                    to: *to,
+                    tasks: tasks.clone(),
+                })
                 .collect();
             return Err(CascadeGraphError::Cycle { tiers, blocked_dependencies });
         }
@@ -273,11 +348,36 @@ impl CascadeGraph {
         Ok(graph)
     }
 
+    /// Deterministic topological projection of the global union of task-path
+    /// transitions. This is useful for stable graph presentation and Slot
+    /// assignment. Runtime scheduling follows task_path(), so an unrelated
+    /// task's predecessor never becomes a barrier for this task.
     pub fn order(&self) -> &[TierId] { &self.order }
 
-    /// All precedence constraints in the union DAG, with the task paths that
-    /// contributed each edge. The returned order is deterministic.
-    pub fn dependencies(&self) -> &[CascadeDependency] { &self.dependencies }
+    /// The materialized tier instances in one task's authored Cascade order.
+    pub fn task_path(&self, task: &str) -> Option<&[TierId]> {
+        self.paths.get(task).map(Vec::as_slice)
+    }
+
+    /// Tasks whose authored paths contain this transition. These are
+    /// progression edges, not shared-computation dependencies.
+    pub fn tasks_on_transition(
+        &self,
+        from: &TierId,
+        to: &TierId,
+    ) -> Option<&BTreeSet<String>> {
+        self.progression_edges.get(&(*from, *to))
+    }
+
+    /// All task-path precedence edges, with the tasks that contributed each edge.
+    /// The iterator is derived from the canonical provenance map.
+    pub fn dependencies(&self) -> impl Iterator<Item = CascadeDependency> + '_ {
+        self.progression_edges.iter().map(|((from, to), tasks)| CascadeDependency {
+            from: *from,
+            to: *to,
+            tasks: tasks.clone(),
+        })
+    }
 
     pub fn task_uses(&self, task: &str, tier: &TierId) -> bool {
         self.tasks_by_tier.get(tier).is_some_and(|tasks| tasks.contains(task))
@@ -392,6 +492,28 @@ mod tests {
         let names: Vec<_> = graph.order().iter()
             .map(|id| graph.tier_name(id).unwrap().as_str()).collect();
         assert_eq!(names, ["alpha", "beta", "gamma"]);
+
+        let alpha = graph.id_for_name(&tname("alpha")).unwrap();
+        let beta = graph.id_for_name(&tname("beta")).unwrap();
+        let gamma = graph.id_for_name(&tname("gamma")).unwrap();
+        assert_eq!(graph.task_path("first").unwrap(), &[alpha, gamma]);
+        assert_eq!(graph.task_path("second").unwrap(), &[beta, gamma]);
+        assert_eq!(
+            graph.tasks_on_transition(&alpha, &gamma).unwrap(),
+            &BTreeSet::from(["first".to_string()]),
+        );
+        assert_eq!(
+            graph.tasks_on_transition(&beta, &gamma).unwrap(),
+            &BTreeSet::from(["second".to_string()]),
+        );
+    }
+
+    #[test]
+    fn contradictory_task_paths_are_rejected_as_a_cycle() {
+        let registry = registry(&["alpha", "beta"]);
+        let tasks = vec![task("first", &["alpha", "beta"]), task("second", &["beta", "alpha"])];
+        assert!(matches!(CascadeGraph::from_tasks(&tasks, &registry),
+            Err(CascadeGraphError::Cycle { .. })));
     }
 
     #[test]
@@ -403,23 +525,21 @@ mod tests {
         ];
         let graph = CascadeGraph::from_tasks(&tasks, &registry).unwrap();
 
-        assert_eq!(graph.dependencies().len(), 1);
-        assert_eq!(
-            graph.dependencies()[0].from,
-            graph.id_for_name(&tname("alpha")).unwrap(),
-        );
-        assert_eq!(
-            graph.dependencies()[0].to,
-            graph.id_for_name(&tname("beta")).unwrap(),
-        );
+        let dependencies: Vec<_> = graph.dependencies().collect();
+        assert_eq!(dependencies.len(), 1);
+        assert_eq!(dependencies[0].from, graph.id_for_name(&tname("alpha")).unwrap());
+        assert_eq!(dependencies[0].to, graph.id_for_name(&tname("beta")).unwrap());
         let expected: BTreeSet<String> = ["first", "second"].into_iter().map(str::to_string).collect();
-        assert_eq!(graph.dependencies()[0].tasks, expected);
+        assert_eq!(dependencies[0].tasks, expected);
     }
 
     #[test]
     fn contradictory_task_paths_report_the_owners_of_blocked_dependencies() {
         let registry = registry(&["alpha", "beta"]);
-        let tasks = vec![task("first", &["alpha", "beta"]), task("second", &["beta", "alpha"])];
+        let tasks = vec![
+            task("first", &["alpha", "beta"]),
+            task("second", &["beta", "alpha"]),
+        ];
         let error = match CascadeGraph::from_tasks(&tasks, &registry) {
             Err(error) => error,
             Ok(_) => panic!("contradictory task paths must fail graph compilation"),
@@ -436,6 +556,40 @@ mod tests {
         let expected_owners: BTreeSet<String> = ["first", "second"].into_iter().map(str::to_string).collect();
         assert_eq!(owners, expected_owners);
         assert!(blocked_dependencies.iter().all(|edge| edge.tasks.len() == 1));
+    }
+
+    #[test]
+    fn cycle_diagnostics_exclude_downstream_blocked_tiers_from_cycle_membership() {
+        let registry = registry(&["alpha", "beta", "gamma", "delta"]);
+        let tasks = vec![
+            task("forward", &["alpha", "beta"]),
+            task("reverse", &["beta", "alpha"]),
+            task("downstream", &["beta", "gamma", "delta"]),
+        ];
+        let error = match CascadeGraph::from_tasks(&tasks, &registry) {
+            Err(error) => error,
+            Ok(_) => panic!("the contradictory paths must fail graph compilation"),
+        };
+        let CascadeGraphError::Cycle { tiers, blocked_dependencies } = error else {
+            panic!("the contradictory paths must produce a cycle error");
+        };
+
+        let singleton_tasks = vec![
+            task("alpha_only", &["alpha"]),
+            task("beta_only", &["beta"]),
+            task("gamma_only", &["gamma"]),
+            task("delta_only", &["delta"]),
+        ];
+        let singleton_graph = CascadeGraph::from_tasks(&singleton_tasks, &registry).unwrap();
+        let expected_cycle_tiers: BTreeSet<_> = [
+            singleton_graph.id_for_name(&tname("alpha")).unwrap(),
+            singleton_graph.id_for_name(&tname("beta")).unwrap(),
+        ].into_iter().collect();
+        assert_eq!(tiers.into_iter().collect::<BTreeSet<_>>(), expected_cycle_tiers);
+        assert_eq!(blocked_dependencies.len(), 4);
+        let beta = singleton_graph.id_for_name(&tname("beta")).unwrap();
+        let gamma = singleton_graph.id_for_name(&tname("gamma")).unwrap();
+        assert!(blocked_dependencies.iter().any(|edge| edge.from == beta && edge.to == gamma));
     }
 
     #[test]
