@@ -506,6 +506,22 @@ mod tests {
     }
 
     #[test]
+    fn encoder_declaration_requires_a_concrete_model_identifier() {
+        let result = parse(r#"
+            [task.route]
+            cascade = ["encoder"]
+            fallback_label = "needs_llm"
+            [[tier]]
+            name = "encoder"
+            executor = "encoder"
+            model_format = "onnx"
+            transport = "grpc"
+            request_shape = "score_tasks"
+        "#);
+        assert!(result.is_err_and(|error| error.to_string().contains("concrete model identifier")));
+    }
+
+    #[test]
     fn explicit_tier_registry_requires_each_task_cascade() {
         let result = parse(r#"
             [task.route]
