@@ -440,7 +440,7 @@ impl TierInstance {
         };
         field("tier_name", name.as_str());
         // Keep the legacy hash-domain key stable so existing TierIds remain unchanged.
-        field("role", tier.strategy.as_str());
+        field("exec", tier.strategy.as_str());
         field("transport", match tier.transport {
             Transport::InProcess => "in_process",
             Transport::Grpc => "grpc",
