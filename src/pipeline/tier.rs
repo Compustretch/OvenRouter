@@ -439,7 +439,7 @@ impl TierInstance {
             digest.update(b"\0");
         };
         field("tier_name", name.as_str());
-        // Keep the legacy hash-domain key stable so existing TierIds remain unchanged.
+        // The selected execution strategy contributes to the TierId identity.
         field("exec", tier.strategy.as_str());
         field("transport", match tier.transport {
             Transport::InProcess => "in_process",
