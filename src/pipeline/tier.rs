@@ -692,7 +692,7 @@ mod tests {
     impl Tier3Scorer for TestSidecar {
         async fn score(
             &self,
-            _request: Request<ScoreRequest>,
+            request: Request<ScoreRequest>,
         ) -> Result<Response<ScoreResponse>, Status> {
             assert_eq!(
                 request.metadata().get("x-jev-model").and_then(|value| value.to_str().ok()),
