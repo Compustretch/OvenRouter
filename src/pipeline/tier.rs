@@ -27,7 +27,7 @@ use sha2::{Digest, Sha256};
 use super::task::{OutputKind, Reading, Task, TierReading, LABEL_JEV, LABEL_LLM};
 use crate::router::tier1_runner::{Tier1Automaton, Tier1Engine};
 use crate::router::tier2_runner::{Tier2Outcome, Tier2Route, Tier2Runner};
-use crate::router::tier3_runner::{TasksError, Tier3Runner};
+use crate::router::grpc_scorer::{TasksError, GrpcScorerClient};
 
 // ---- authored tier name ----------------------------------------------------
 
@@ -259,7 +259,7 @@ pub trait FakeEvaluate: Send + Sync {
 enum Runner {
     Rules(Arc<Tier1Engine>),
     FastText(Arc<Tier2Runner>),
-    Grpc(Tier3Runner),
+    Grpc(GrpcScorerClient),
     #[cfg(test)]
     Fake(Arc<dyn FakeEvaluate>),
 }
@@ -397,7 +397,7 @@ impl TierInstance {
                 let model = params.model.as_deref()
                     .filter(|model| !model.trim().is_empty())
                     .ok_or_else(|| format!("tier {name}: encoder tier has no concrete model selection"))?;
-                (Runner::Grpc(Tier3Runner::new(
+                (Runner::Grpc(GrpcScorerClient::new(
                     endpoint,
                     model,
                     Duration::from_millis(timeout_ms),
@@ -530,7 +530,7 @@ impl TierInstance {
         TierOutput { model_id: self.model_label(), readings }
     }
 
-    async fn route_via_score(&self, runner: &Tier3Runner, ctx: &TierContext<'_>) -> TierOutput {
+    async fn route_via_score(&self, runner: &GrpcScorerClient, ctx: &TierContext<'_>) -> TierOutput {
         match runner.score_raw(ctx.prompt, ctx.budget).await {
             Err(reason) => TierOutput::abstain_all(self.model_label(), ctx.tasks, reason),
             Ok(raw) => {
@@ -543,7 +543,7 @@ impl TierInstance {
         }
     }
 
-    async fn evaluate_grpc(&self, runner: &Tier3Runner, ctx: &TierContext<'_>) -> TierOutput {
+    async fn evaluate_grpc(&self, runner: &GrpcScorerClient, ctx: &TierContext<'_>) -> TierOutput {
         match self.tier.request_shape {
             Some(RequestShape::ScoreTasks) => {}
             _ => {
@@ -615,7 +615,7 @@ impl TierInstance {
     }
 
     /// An encoder instance over an already-constructed gRPC runner.
-    pub fn encoder(name: &str, shape: RequestShape, model: Option<&str>, runner: Tier3Runner) -> Self {
+    pub fn encoder(name: &str, shape: RequestShape, model: Option<&str>, runner: GrpcScorerClient) -> Self {
         let tier = Tier { exex: Role::Encoder, transport: Transport::Grpc, request_shape: Some(shape) };
         let params = Params {
             model_format: Some(ModelFormat::Onnx), model: model.map(str::to_string), config: None,
@@ -891,7 +891,7 @@ mod tests {
     async fn joint_sidecar_scores_multiple_tasks_in_one_rpc() {
         let sidecar = TestSidecar { joint: true, ..Default::default() };
         let calls = sidecar.tasks_calls.clone();
-        let scorer = Tier3Runner::new(endpoint(sidecar).await, "test-sidecar", Duration::from_secs(2)).unwrap();
+        let scorer = GrpcScorerClient::new(endpoint(sidecar).await, "test-sidecar", Duration::from_secs(2)).unwrap();
         let tier = TierInstance::encoder("alternate", RequestShape::ScoreTasks, None, scorer);
         let tasks = [String::from("route"), String::from("tag")];
         let profiles = [
@@ -926,7 +926,7 @@ mod tests {
         let sidecar = TestSidecar { joint: true, ..Default::default() };
         let task_calls = sidecar.tasks_calls.clone();
         let score_calls = sidecar.score_calls.clone();
-        let scorer = Tier3Runner::new(endpoint(sidecar).await, "test-sidecar", Duration::from_secs(2)).unwrap();
+        let scorer = GrpcScorerClient::new(endpoint(sidecar).await, "test-sidecar", Duration::from_secs(2)).unwrap();
         let tier = TierInstance::encoder("route-scorer", RequestShape::ScoreTasks, None, scorer);
         let tasks = [String::from("route")];
         let profiles = [Task {
@@ -954,7 +954,7 @@ mod tests {
         let sidecar = TestSidecar { joint: false, ..Default::default() };
         let task_calls = sidecar.tasks_calls.clone();
         let score_calls = sidecar.score_calls.clone();
-        let scorer = Tier3Runner::new(endpoint(sidecar).await, "test-sidecar", Duration::from_secs(2)).unwrap();
+        let scorer = GrpcScorerClient::new(endpoint(sidecar).await, "test-sidecar", Duration::from_secs(2)).unwrap();
         let tier = TierInstance::encoder("no-joint", RequestShape::ScoreTasks, None, scorer);
         let tasks = [String::from("route")];
         let profiles = [Task {
