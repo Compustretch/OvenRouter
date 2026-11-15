@@ -1,7 +1,9 @@
 
 ![OvenRouter](/assets/oven_router_logo.png)
 
+<p align="center">
 <i>"Not all prompts need to be baked at the same temperature."</i>
+</p>
 
 ## Cascade Router Engine
 
