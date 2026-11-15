@@ -93,6 +93,16 @@ pass "Router response echoed X-Request-ID unchanged"
 info "Response body:"
 jq . "$RESPONSE_FILE" || cat "$RESPONSE_FILE"
 
+assert_one_typed_row() {
+    local table="$1"
+    local count
+    count="$(ch_query "SELECT count() FROM ${CLICKHOUSE_DATABASE}.${table} FINAL WHERE request_id = toUUID('${SMOKE_UUID}') FORMAT TabSeparated")" \
+        || fail "Could not count typed rows for ${table}"
+    [[ "${count//[[:space:]]/}" == "1" ]] \
+        || fail "Expected exactly one ${table} row for request_id=${SMOKE_UUID}; found ${count}"
+    printf '[PASS] %s has exactly one row for request_id=%s\n' "$table" "$SMOKE_UUID"
+}
+
 wait_typed_row() {
     local table="$1" request_id="$2" wait_seconds="$3" query="$4" result="" attempt
     for ((attempt=1; attempt<=wait_seconds; attempt++)); do
@@ -115,6 +125,7 @@ LIMIT 1
 FORMAT JSONEachRow
 "
 ROUTE_ROW="$(wait_typed_row route_decisions "$SMOKE_UUID" "$ROUTE_WAIT_SECONDS" "$ROUTE_SQL")"
+assert_one_typed_row route_decisions
 jq -e --arg id "$SMOKE_UUID" '.request_id == $id and .prompt_raw == "What is 18% of 450?"' \
     <<<"$ROUTE_ROW" >/dev/null || fail "Typed route row has a mismatched ID or contaminated prompt"
 pass "route_decisions contains the same UUID and the exact clean prompt"
@@ -131,6 +142,7 @@ LIMIT 1
 FORMAT JSONEachRow
 "
 EXECUTION_ROW="$(wait_typed_row route_execution_results "$SMOKE_UUID" "$ROUTE_WAIT_SECONDS" "$EXECUTION_SQL")"
+assert_one_typed_row route_execution_results
 jq -e --arg id "$SMOKE_UUID" '.request_id == $id and (.dispatch_attempts_json | fromjson | length >= 1)' \
     <<<"$EXECUTION_ROW" >/dev/null || fail "Typed execution projection is not correlated"
 pass "route_execution_results contains the same UUID and terminal attempt history"
@@ -147,6 +159,7 @@ LIMIT 1
 FORMAT JSONEachRow
 "
 TAG_ROW="$(wait_typed_row task_tags "$SMOKE_UUID" "$TAG_WAIT_SECONDS" "$TAG_SQL")"
+assert_one_typed_row task_tags
 jq -e --arg id "$SMOKE_UUID" '.request_id == $id' <<<"$TAG_ROW" >/dev/null \
     || fail "Typed task-tag projection has a mismatched request ID"
 pass "task_tags contains the same UUID"

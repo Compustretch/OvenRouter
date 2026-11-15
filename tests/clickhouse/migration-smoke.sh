@@ -212,6 +212,44 @@ pass "Applied 006_execution_results.sql"
 # New-format records are inserted after the materialized view exists.
 insert_jsonl "${PROJECT_ROOT}/tests/clickhouse/006_execution_results.new.fixture.jsonl"
 
+# Correlate a raw route event and raw task-tag event using one UUID. The route
+# event above uses f4; attach a tag record with precisely that same request ID.
+CORRELATION_UUID="00000000-0000-4000-8000-0000000000f4"
+TAG_RECORD="$(jq -cn --arg id "$CORRELATION_UUID" '{
+    request_id: $id,
+    timestamp: "2026-11-15T10:00:04.000001Z",
+    taxonomy_version: "test-v1",
+    tagger_model: "test-tagger",
+    tagger_version: "1.0.0",
+    task_id: "tag",
+    output_kind: "multiclass",
+    latency_ms: 1.0,
+    queue_wait_ms: 0.1,
+    result: {
+        status: "tagged",
+        primary: {category_id: "help_desk", score: 0.95},
+        alternatives: []
+    }
+}')"
+TAG_INSERT_SQL="INSERT INTO ${DATABASE}.task_tags_raw (line) FORMAT JSONAsString"
+TAG_INSERT_QUERY="$(jq -rn --arg q "$TAG_INSERT_SQL" '$q | @uri')"
+curl_ch --request POST "${CLICKHOUSE_URL}/?query=${TAG_INSERT_QUERY}" \
+    --data-binary "$TAG_RECORD" >/dev/null || fail "Could not insert correlated task-tag event"
+
+for table in route_decisions route_execution_results task_tags; do
+    ROW_COUNT="$(query "SELECT count() FROM ${DATABASE}.${table} FINAL WHERE request_id=toUUID('${CORRELATION_UUID}') FORMAT TabSeparated")" \
+        || fail "Could not count typed ${table} rows for correlation UUID"
+    [[ "${ROW_COUNT//[[:space:]]/}" == "1" ]] \
+        || fail "Expected exactly one typed ${table} row for ${CORRELATION_UUID}; found ${ROW_COUNT}"
+done
+
+RAW_ROUTE_COUNT="$(query "SELECT count() FROM ${DATABASE}.route_records_raw WHERE JSONExtractString(line, 'request_id')='${CORRELATION_UUID}' FORMAT TabSeparated")"
+RAW_TAG_COUNT="$(query "SELECT count() FROM ${DATABASE}.task_tags_raw WHERE JSONExtractString(line, 'request_id')='${CORRELATION_UUID}' FORMAT TabSeparated")"
+[[ "$RAW_ROUTE_COUNT" == "1" && "$RAW_TAG_COUNT" == "1" ]] \
+    || fail "Expected one raw route and one raw task-tag event for ${CORRELATION_UUID}"
+pass "Raw route/tag events and typed route_decisions/route_execution_results/task_tags share one UUID"
+
+
 ROWS="$(query "SELECT toString(request_id) AS request_id, cascade_decision_tier, decided_by_tier_name, dispatch_attempts_json, final_strategy, final_provider, final_model_id, final_status, final_failure_reason FROM ${DATABASE}.route_execution_results FINAL ORDER BY request_id FORMAT JSONEachRow")" \
     || fail "Could not read canonical execution projection"
 [[ -n "$ROWS" ]] || fail "Migration 006 produced no execution projection rows"

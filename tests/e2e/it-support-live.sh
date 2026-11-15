@@ -100,6 +100,17 @@ assert_leaf_category() {
         || record_failure "Expected taxonomy leaf '$expected', received '${category:-empty}'"
 }
 
+assert_one_typed_row() {
+    local table="$1"
+    local request_id="$2"
+    local count
+    count="$(ch_query "SELECT count() FROM ${CLICKHOUSE_DATABASE}.${table} FINAL WHERE request_id = toUUID('${request_id}') FORMAT TabSeparated")" \
+        || fail "Could not count typed rows for ${table} request_id=${request_id}"
+    [[ "${count//[[:space:]]/}" == "1" ]] \
+        || fail "Expected exactly one ${table} row for request_id=${request_id}; found ${count}"
+    printf '[PASS] %s has exactly one row for request_id=%s\n' "$table" "$request_id" >&2
+}
+
 wait_route_record() {
     local request_id="$1"
     local expected_prompt="$2"
@@ -120,6 +131,7 @@ FORMAT JSONEachRow
         sleep 1
     done
     [[ -n "$result" ]] || fail "No typed route_decisions row appeared for $request_id"
+    assert_one_typed_row route_decisions "$request_id"
     jq -e --arg id "$request_id" --arg prompt "$expected_prompt" \
         '.request_id == $id and .prompt_raw == $prompt' <<<"$result" >/dev/null \
         || fail "Typed route_decisions request ID or clean prompt mismatch for $request_id"
@@ -144,6 +156,7 @@ FORMAT JSONEachRow
         sleep 1
     done
     [[ -n "$result" ]] || fail "No typed task_tags row appeared for $request_id"
+    assert_one_typed_row task_tags "$request_id"
     jq -e --arg id "$request_id" '.request_id == $id' <<<"$result" >/dev/null \
         || fail "Typed task_tags request ID mismatch for $request_id"
     printf '%s' "$result"
@@ -167,6 +180,7 @@ FORMAT JSONEachRow
         sleep 1
     done
     [[ -n "$result" ]] || fail "No route_execution_results row appeared for $request_id"
+    assert_one_typed_row route_execution_results "$request_id"
     jq -e --arg id "$request_id" '.request_id == $id' <<<"$result" >/dev/null \
         || fail "Typed route_execution_results request ID mismatch for $request_id"
     printf '%s' "$result"
