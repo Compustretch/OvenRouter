@@ -1,6 +1,6 @@
 <h1 align="center">OvenRouter </h1>
 
-![OvenRouter](/assets/oven_router_logo.png
+![OvenRouter](/assets/oven_router_logo.png)
 
 ## Cascade Router Engine
 
