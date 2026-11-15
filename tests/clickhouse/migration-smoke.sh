@@ -40,9 +40,7 @@ curl_ch() {
 
 query() {
     local sql="$1"
-    local encoded
-    encoded="$(jq -rn --arg q "$sql" '$q | @uri')"
-    curl_ch --request POST "${CLICKHOUSE_URL}/?query=${encoded}"
+    curl_ch --request POST "${CLICKHOUSE_URL}/" --data-binary "$sql"
 }
 
 migration() {
@@ -188,9 +186,7 @@ insert_jsonl() {
 }
 cleanup() {
     local sql="DROP DATABASE IF EXISTS ${DATABASE} SYNC"
-    local encoded
-    encoded="$(jq -rn --arg q "$sql" '$q | @uri')"
-    curl_ch --request POST "${CLICKHOUSE_URL}/?query=${encoded}" >/dev/null 2>&1 || true
+    curl_ch --request POST "${CLICKHOUSE_URL}/" --data-binary "$sql" >/dev/null 2>&1 || true
 }
 trap cleanup EXIT
 
