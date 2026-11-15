@@ -566,8 +566,9 @@ mod tests {
         let graph = CascadeGraph::from_tasks(&profiles, &registry).unwrap();
         let runner = CascadeRunner::new(graph);
         assert!(registry.get(&tname("harrier")).is_some());
-        assert!(runner.graph().id_for_name(&tname("harrier")).is_none());
-        assert!(runner.graph().instance_for_name(&tname("harrier")).is_none());
+        let harrier_id = runner.graph().id_for_name(&tname("harrier"));
+        assert!(harrier_id.is_none());
+        assert!(harrier_id.and_then(|id| runner.graph().instance(&id)).is_none());
     }
 
     #[tokio::test]
