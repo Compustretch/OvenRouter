@@ -44,7 +44,7 @@ The engine is a **six-tier deterministic fallback cascade**. Each tier either re
 - **Early exit.** A request leaves the cascade at the first tier whose confidence meets its configured threshold.
 - **No GC pauses, minimal allocation.** The hot path is native Rust with C++ bindings, a replaced global allocator, and zero-copy ingress for the cheapest tiers.
 - **Deterministic behavior.** Given the same input, model artifacts, and configuration, the router returns the same decision.
-- **Independent semantic stages.** ModernBERT and Harrier run as sequential tiers with separate enable flags; ModernBERT currently abstains until ONNX inference is integrated.
+- **One encoder stage.** ModernBERT and Harrier are concrete model choices behind the encoder executor, not separate cascade tiers. A task path contains one encoder tier, whose declaration selects the model.
 
 ---
 
@@ -63,22 +63,22 @@ The `TierRegistry` catalogs available `Tier` definitions and their declarative p
 
 ```toml
 [task.route]
-cascade = ["rules", "fasttext", "modernbert", "harrier"]
+cascade = ["rules", "fasttext", "encoder"]
 labels = ["jev_capable", "needs_llm"]
 fallback_label = "needs_llm"
 
 [task.tag]
-cascade = ["modernbert", "harrier"]
+cascade = ["encoder"]
 output_kind = "multiclass"
 fallback = "defer"
 
 [tier_policy.rules.route]
 min_confidence = 0.78
 
-[tier_policy.modernbert.route]
+[tier_policy.encoder.route]
 min_confidence = 0.95
 
-[tier_policy.modernbert.tag]
+[tier_policy.encoder.tag]
 min_confidence = 0.85
 ```
 
@@ -88,9 +88,9 @@ A new task adds its output contract, ordered `cascade` of TierNames, and policie
 
 The identity layers stay distinct. `TierName` identifies an authored tier definition and appears in task cascades. `TierId` is generated only when `CascadeGraph` materializes a concrete instance; the hash includes its name and behavior-determining configuration, including inference runtime, model-related configuration and loaded artifact content. Endpoint and timeout are deployment details, not identity. `Slot` is the instance's position in the compiled graph, an execution/telemetry address rather than an identity.
 
-`model_format` selects the inference runtime at the adapter boundary. The router selects the corresponding adapter endpoint but does not compare or validate the model identity reported by a sidecar. `TierInstance` is the concrete realization of a definition and is owned by `CascadeGraph`, not by `TierRegistry`.
+`model` in the named tier declaration identifies the concrete model; `model_format` identifies its inference format. `Tier` remains an abstract executor/transport/request-shape descriptor. `TierInstance` resolves the declaration and passes the model identifier to the executor. The encoder request formatter carries that identifier through gRPC metadata, and the sidecar rejects a request when its loaded model does not match. `TierInstance` is owned by `CascadeGraph`, not by `TierRegistry`.
 
-The original four tiers were once numbered 1 to 4, and those numbers survive at the edges: numbered telemetry fields, `[router.tierN]` settings, numbered environment variables and `tierN` aliases in `[tier_policy.*]` keys. The `[legacy_tiers]` table in `tasks.toml` is the only place a name and a number meet. It is read at load and handed to code that writes those compatibility surfaces; no tier, instance, registry or Cascade carries a number. Configuration with no explicit `[[tier]]` entries keeps the original numbering.
+The original four tiers were once numbered 1 to 4, and those numbers survive at the edges: numbered telemetry fields, `[router.tierN]` settings, numbered environment variables and `tierN` aliases in `[tier_policy.*]` keys. The `[legacy_tiers]` table in `tasks.toml` is the only place a name and a number meet. It is read at load and handed to code that writes those compatibility surfaces; no tier, instance, registry or Cascade carries a number. Configuration with no explicit `[[tier]]` entries defaults to rules (1), fastText (2), and one encoder stage (3); historical tier-4 telemetry remains a compatibility field.
 
 `CascadeGraph` computes a deterministic topological projection of the global union of task-path transitions by resolving adjacent TierName pairs to hash-derived TierIds. That order supports stable graph presentation and `Slot` assignment; it is not a global runtime barrier. The runner advances each task along its own ordered path and concurrently evaluates independent ready nodes. Shared TierNames resolve to one shared `TierInstance`; tasks ready together at that node are batched, while later cohorts can invoke the same instance independently. Definitions absent from every task path remain available in the registry but do not materialize. The complete `tier_outcomes` array remains name-keyed in per-task progression order; existing numbered fields remain compatibility projections. Tiers 5 and 6 are downstream execution backends, not Cascade nodes.
 
@@ -116,21 +116,12 @@ The original four tiers were once numbered 1 to 4, and those numbers survive at 
 - **Robust** to typos, inflections, and fuzzy keyword variation, because subword features generalize across spellings.
 - **Artifact:** quantized binary `router_fastpath.ftz`.
 
-### Tier 3: ModernBERT ONNX Runtime
+### Tier 3: Encoder Executor
 
-- **Placement:** ModernBERT evaluates requests after FastText and before Harrier.
-- **Runtime:** ModernBERT runs through ONNX Runtime, not GGUF. The router calls a dedicated gRPC sidecar, which tokenizes the prompt and scores the two-class ONNX output.
-
-### Tier 4: Micro-Transformer / Embedding Evaluators
-
-- **Engines:** Harrier or Oryn. Exactly one in-process engine is selected through configuration. A remote gRPC evaluator can be used instead.
-In-process path: Int8-quantized ONNX models executed by ONNX Runtime (ort), with the HuggingFace tokenizers Rust library for tokenization.
-- **Scoring:** the prompt embedding is compared by cosine similarity (SIMD-accelerated with simsimd) against pre-computed route centroids.
-SIMD targets: AVX-512 on x86-64, NEON on ARM.
-Remote path: the gRPC client in src/tier2/remote/ allows the same evaluator contract to be served out of process.
-
-- **Semantic Classification:** Harrier is the gRPC-backed classifier after ModernBERT. A confident result resolves the route; weak or failed evaluations pass through to Tier 5.
-- **Independent Stage:** ModernBERT and Harrier are separate sequential tiers, not swappable backends.
+- **One execution stage:** The encoder executor fronts one selected model for a given tier instance. ModernBERT and Harrier are model implementations, not separate cascade stages.
+- **Model selection:** The tier declaration names the concrete model and its format. The instance passes that selection through the executor and gRPC transport to the sidecar, which validates that the request targets the model it loaded.
+- **Joint inference:** With `request_shape = "score_tasks"`, the sidecar encodes the prompt once and evaluates each requested task head against the shared representation. Route and tag therefore share one encoder invocation when both tasks are ready in the same cohort.
+- **Alternative model:** Harrier can replace ModernBERT by changing the encoder tier's `model`, `model_format`, and endpoint configuration. It does not appear as another element in the task Cascade.
 
 ### Tier 5: Jev Self-Evaluation
 
@@ -481,7 +472,7 @@ Engines must not allocate on the per-request hot path where avoidable, and must 
 
 - **Tier pass-through:** low confidence is not an error. It is the normal escalation path.
 - **Model load failure at startup:** the router should fail fast rather than silently run with a tier missing. Disabling a tier must be an explicit configuration choice.
-- **Tier 4 timeout:** Harrier timeouts and RPC failures pass through to Jev Tier 5.
+- **Encoder timeout:** encoder timeouts and RPC failures pass through to Jev Tier 5.
 - **Tier 5 failure:** Jev ineligibility or failure falls through to the generative Tier 6 endpoint when enabled.
 - **Tier 6 unavailable:** the terminal tier is an external dependency; provider failures return an explicit gateway error.
 - **Oversize or malformed payloads:** rejected at tier 1 based on `max_payload_bytes`.
