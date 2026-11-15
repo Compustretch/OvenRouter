@@ -1,8 +1,8 @@
 // src/router/tier3_runner.rs
 //
-// Generic gRPC client for task-scoring sidecars. Tier 3 (ModernBERT), Tier 4
-// (Harrier), and any compatible future sidecar use this same wire-protocol
-// implementation. It returns raw predictions; task policies resolve them.
+// Generic gRPC transport for the encoder executor. The selected concrete model
+// is supplied by the tier instance and formatted into every sidecar request.
+// The runner returns raw predictions; task policies resolve them.
 
 use std::time::Duration;
 
