@@ -144,7 +144,7 @@ migration() {
                     emit_statement()
                     continue
                 }
-                sql = sql (ch == "\\n" ? " " : ch)
+                sql = sql (ch == "\n" ? " " : ch)
             }
         }
         END {
@@ -160,8 +160,17 @@ migration() {
     }
 
     statement_number=0
-    while IFS= read -r -d 
+    while IFS= read -r -d $'\036' statement; do
+        statement_number=$((statement_number + 1))
+        if ! curl_ch --request POST "${CLICKHOUSE_URL}/" --data-binary "$statement" >/dev/null; then
+            rm -f "$sql_file" "$statements_file"
+            fail "Statement $statement_number failed in migration $(basename "$path")"
+        fi
+    done < "$statements_file"
 
+    rm -f "$sql_file" "$statements_file"
+    [[ "$statement_number" -gt 0 ]] || fail "Migration contains no SQL statements: $path"
+}
 insert_jsonl() {
     local path="$1"
     local sql="INSERT INTO ${DATABASE}.route_records_raw FORMAT JSONAsString"
