@@ -80,7 +80,6 @@ min_confidence = 0.95
 label_min_confidence = { jev_capable = 0.95, needs_llm = 0.70 }
 
 
-# To evaluate route and tag heads in one ScoreTasks call, change the relevant
-# tier's request_shape to "score_tasks" and add its tag policy:
+# The route and tag heads share one encoder invocation through ScoreTasks.
 [tier_policy.encoder.tag]
 min_confidence = 0.85
