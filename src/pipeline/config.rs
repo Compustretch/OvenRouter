@@ -79,12 +79,11 @@ fn default_tier_configs() -> Vec<TierConfig> {
     [
         ("rules", Role::Rules, Transport::InProcess, None, None),
         ("fasttext", Role::FastText, Transport::InProcess, None, None),
-        ("modernbert", Role::Encoder, Transport::Grpc, Some(RequestShape::Score), Some(ModelFormat::Onnx)),
-        ("harrier", Role::Encoder, Transport::Grpc, Some(RequestShape::Score), Some(ModelFormat::Gguf)),
+        ("encoder", Role::Encoder, Transport::Grpc, Some(RequestShape::ScoreTasks), Some(ModelFormat::Onnx)),
     ].into_iter().map(|(name, role, transport, request_shape, model_format)| (
         TierName::new(name).expect("built-in tier names are valid"),
         Tier { exex: role, transport, request_shape },
-        Params { model_format, model: match model_format { Some(ModelFormat::Onnx) => Some("modernbert-onnx".into()), Some(ModelFormat::Gguf) => Some("harrier-270m".into()), None => None }, config: None, endpoint: None, timeout_ms: None, enabled: None },
+        Params { model_format, model: if role == Role::Encoder { Some("modernbert-onnx".into()) } else { None }, config: None, endpoint: None, timeout_ms: None, enabled: None },
     )).collect()
 
 }
@@ -163,7 +162,7 @@ fn legacy_numbers_from(
         return Ok(if has_explicit_tier_registry {
             LegacyTierNumbers::default()
         } else {
-            LegacyTierNumbers::original_four()
+            LegacyTierNumbers::original_three()
         });
     };
     let mut pairs = Vec::with_capacity(declared.len());
@@ -520,10 +519,10 @@ mod tests {
     }
 
     #[test]
-    fn legacy_config_defaults_each_task_to_the_original_four_tiers() {
+    fn legacy_config_defaults_each_task_to_rules_fasttext_and_one_encoder() {
         let cfg = parse("[task.route]\nfallback_label = \"needs_llm\"").unwrap();
         let names: Vec<_> = cfg.profiles["route"].cascade.tiers().iter().map(TierName::as_str).collect();
-        assert_eq!(names, ["rules", "fasttext", "modernbert", "harrier"]);
+        assert_eq!(names, ["rules", "fasttext", "encoder"]);
     }
 
     #[test]
