@@ -9,12 +9,14 @@ use super::tier::{Params, Tier, TierName};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RegistryError {
     DuplicateName(TierName),
+    InvalidDefinition { name: TierName, reason: String },
 }
 
 impl fmt::Display for RegistryError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::DuplicateName(name) => write!(f, "tier {name} is registered twice"),
+            Self::InvalidDefinition { name, reason } => write!(f, "tier {name} has an invalid definition: {reason}"),
         }
     }
 }
@@ -42,6 +44,10 @@ impl TierRegistry {
         if self.entries.contains_key(&name) {
             return Err(RegistryError::DuplicateName(name));
         }
+        tier.validate().map_err(|reason| RegistryError::InvalidDefinition {
+            name: name.clone(),
+            reason: reason.to_string(),
+        })?;
         self.entries.insert(name, (tier, params));
         Ok(())
     }
@@ -125,6 +131,34 @@ mod tests {
         assert_eq!(registry.len(), 2);
         assert!(registry.get(&tname("encoder")).is_some());
         assert!(registry.get(&tname("unused")).is_some());
+    }
+
+    #[test]
+    fn terminal_strategies_cannot_be_registered_as_cascade_tiers() {
+        let mut registry = TierRegistry::new();
+        let params = Params {
+            model_format: None,
+            model: None,
+            config: None,
+            endpoint: None,
+            timeout_ms: None,
+            enabled: None,
+        };
+        for (name, strategy) in [
+            ("decision", Strategy::Decision),
+            ("generative", Strategy::Generative),
+        ] {
+            let tier = Tier {
+                strategy,
+                transport: Transport::InProcess,
+                request_shape: None,
+            };
+            assert!(matches!(
+                registry.register(tname(name), tier, params.clone()),
+                Err(RegistryError::InvalidDefinition { .. })
+            ));
+        }
+        assert!(registry.is_empty());
     }
 
     #[test]

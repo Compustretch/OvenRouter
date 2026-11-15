@@ -28,13 +28,14 @@ use crate::pipeline::task::{
 };
 use crate::tagging::{is_sampled, TagInput, TagQueue};
 use crate::telemetry::{
-    FinalRouting, Hashes, RouteRecord, Sampling, Tier1Outcome as Tier1Record,
-    TaskDecisionRecord, TaskLabelScore, TierOutcomeRecord, Tier2Outcome as Tier2Record, Tier3Outcome as Tier3Record, Tier4Outcome as Tier4Record,
+    DispatchAttemptRecord, FinalResultRecord, FinalRouting, Hashes, RouteRecord, Sampling,
+    Tier1Outcome as Tier1Record, TaskDecisionRecord, TaskLabelScore, TierOutcomeRecord,
+    Tier2Outcome as Tier2Record, Tier3Outcome as Tier3Record, Tier4Outcome as Tier4Record,
 };
 
 use super::{
-    cascade::Backend,
-    dispatch::{downstream_tier_name, DownstreamDispatcher},
+    cascade::Strategy,
+    dispatch::{DispatchAttempt, DownstreamDispatcher, FinalResult},
 };
 
 pub struct AppDependencies {
@@ -258,21 +259,21 @@ async fn completion(
             "cascade tier completed"
         );
     }
-    let (backend, mut record) =
+    let (strategy, mut record) =
         route_record(request_id, &route_input, &state.hashes, &state.cascade_order, &state.legacy, &request_profiles, &outcome, route_started);
 
     tracing::info!(
         request_id = %record.request_id,
-        backend = %backend,
+        strategy = strategy.as_str(),
         decided_by_tier = record.cascade_decision_tier,
-        "dispatching completion request to downstream backend"
+        "dispatching completion request to terminal strategy"
     );
 
     match state
         .dispatcher
         .execute(
             &record.request_id,
-            backend,
+            strategy,
             &fallback_prompt,
             request.state.as_ref(),
             request.questions.as_ref(),
@@ -287,23 +288,7 @@ async fn completion(
             };
             let response_text = payload.to_string();
             let request_id = record.request_id.clone();
-            record.final_routing.backend = downstream_tier_name(result.tier).into();
-            record.final_routing.tier = result.tier;
-            record.final_routing.tier_name = downstream_tier_name(result.tier).into();
-            record.final_routing.latency_us += result.request_latency.as_micros();
-            record.downstream_invocation_latency_ms =
-                result.invocation_latency.as_secs_f64() * 1000.0;
-            record.downstream_outcome = Some(result.outcome.into());
-            record.downstream_tier = Some(format!("tier{}", result.tier));
-            record.is_failover = result.is_failover;
-            record.failure_reason = result.failure_reason;
-            if result.is_failover {
-                record.request_latency_failover_ms =
-                    Some(result.request_latency.as_secs_f64() * 1000.0);
-            } else {
-                record.request_latency_primary_ms =
-                    Some(result.request_latency.as_secs_f64() * 1000.0);
-            }
+            apply_dispatch_result(&mut record, &result.attempts, &result.final_result, result.request_latency);
             capture(&state.capture_tx, record);
             state.tag_queue.enqueue(TagInput {
                 request_id,
@@ -315,20 +300,7 @@ async fn completion(
         Err(error) => {
             let detail = error.error.to_string();
             let request_id = record.request_id.clone();
-            record.final_routing.backend = "llm".into();
-            record.final_routing.tier = error.tier;
-            record.final_routing.tier_name = downstream_tier_name(error.tier).into();
-            record.final_routing.latency_us += error.request_latency.as_micros();
-            record.downstream_invocation_latency_ms =
-                error.invocation_latency.as_secs_f64() * 1000.0;
-            record.downstream_outcome = Some(error.outcome.into());
-            record.downstream_tier = Some(format!("tier{}", error.tier));
-            record.is_failover = error.is_failover;
-            record.failure_reason = Some(error.failure_reason);
-            if error.is_failover {
-                record.request_latency_failover_ms =
-                    Some(error.request_latency.as_secs_f64() * 1000.0);
-            }
+            apply_dispatch_result(&mut record, &error.attempts, &error.final_result, error.request_latency);
             capture(&state.capture_tx, record);
             state.tag_queue.enqueue(TagInput {
                 request_id,
@@ -358,21 +330,21 @@ fn route_record(
     profiles: &[Task],
     outcome: &RunOutcome,
     started: Instant,
-) -> (Backend, RouteRecord) {
+) -> (Strategy, RouteRecord) {
     let route_outcome = outcome.tasks.get(&String::from("route"));
     // The numeric value is the legacy ordinal (0 for a tier without one); the
     // name is the identity. Fallback keeps its historical value of 6.
-    let (backend, decision_tier, decision_tier_name, decision_tier_id) = match route_outcome.map(|task| &task.resolution) {
+    let (strategy, decision_tier, decision_tier_name, decision_tier_id) = match route_outcome.map(|task| &task.resolution) {
         Some(Resolution::Tier { tier_id, tier, reading, .. }) => (
-            backend_for_label(&reading.label),
+            strategy_for_label(&reading.label),
             legacy.ordinal_of(tier).unwrap_or(0),
             tier.to_string(),
             tier_id.to_string(),
         ),
         Some(Resolution::Fallback { label }) => {
-            (backend_for_label(label), 6, FALLBACK_TIER_NAME.to_string(), String::new())
+            (strategy_for_label(label), 6, FALLBACK_TIER_NAME.to_string(), String::new())
         }
-        Some(Resolution::Deferred) | None => (Backend::Llm, 6, FALLBACK_TIER_NAME.to_string(), String::new()),
+        Some(Resolution::Deferred) | None => (Strategy::Generative, 6, FALLBACK_TIER_NAME.to_string(), String::new()),
     };
 
     let trace = route_outcome.map(|task| task.trace.as_slice()).unwrap_or(&[]);
@@ -467,8 +439,10 @@ fn route_record(
         cascade_decision_tier: decision_tier,
         decided_by_tier_name: decision_tier_name.clone(),
         decided_by_tier_id: decision_tier_id,
+        dispatch_attempts: Vec::new(),
+        final_result: None,
         final_routing: FinalRouting {
-            backend: backend.to_string(),
+            backend: String::new(),
             tier: decision_tier,
             tier_name: decision_tier_name,
             latency_us,
@@ -484,14 +458,61 @@ fn route_record(
         sampling: Sampling::default(),
     };
 
-    (backend, record)
+    (strategy, record)
 }
 
-fn backend_for_label(label: &str) -> Backend {
+fn strategy_for_label(label: &str) -> Strategy {
     if label == LABEL_JEV {
-        Backend::Jev
+        Strategy::Decision
     } else {
-        Backend::Llm
+        Strategy::Generative
+    }
+}
+
+/// Copy the dispatch result into canonical telemetry and legacy projections.
+/// Dispatch attempts and final_result are authoritative. The old flat fields
+/// remain only for consumers that have not yet moved to the new columns.
+fn apply_dispatch_result(
+    record: &mut RouteRecord,
+    attempts: &[DispatchAttempt],
+    final_result: &FinalResult,
+    request_latency: Duration,
+) {
+    record.dispatch_attempts = attempts.iter().map(|attempt| DispatchAttemptRecord {
+        strategy: attempt.strategy.as_str().to_string(),
+        provider: attempt.provider.map(|provider| provider.as_str().to_string()),
+        model_id: attempt.model_id.clone(),
+        outcome: attempt.outcome.clone(),
+        latency_ms: attempt.latency.as_secs_f64() * 1000.0,
+        failure_reason: attempt.failure_reason.clone(),
+    }).collect();
+    record.final_result = Some(FinalResultRecord {
+        strategy: final_result.strategy.as_str().to_string(),
+        provider: final_result.provider.map(|provider| provider.as_str().to_string()),
+        model_id: final_result.model_id.clone(),
+        status: final_result.status.to_string(),
+        failure_reason: final_result.failure_reason.clone(),
+    });
+
+    record.final_routing.backend = final_result.provider
+        .map(|provider| provider.as_str()).unwrap_or("").to_string();
+    // Keep cascade_decision_tier as a cascade ordinal only. In particular,
+    // the historic value 6 means fallback; it never means Generative.
+    record.final_routing.tier = record.cascade_decision_tier;
+    record.final_routing.tier_name = record.decided_by_tier_name.clone();
+    record.final_routing.latency_us += request_latency.as_micros();
+    record.downstream_invocation_latency_ms = attempts.iter()
+        .map(|attempt| attempt.latency.as_secs_f64() * 1000.0)
+        .sum();
+    record.downstream_outcome = Some(final_result.status.to_string());
+    record.downstream_tier = Some(final_result.strategy.as_str().to_string());
+    record.is_failover = attempts.len() > 1;
+    record.failure_reason = attempts.iter()
+        .find_map(|attempt| attempt.failure_reason.clone());
+    if record.is_failover {
+        record.request_latency_failover_ms = Some(request_latency.as_secs_f64() * 1000.0);
+    } else {
+        record.request_latency_primary_ms = Some(request_latency.as_secs_f64() * 1000.0);
     }
 }
 
@@ -886,9 +907,9 @@ mod tests {
     }
 
     #[test]
-    fn downstream_backends_are_named_by_what_they_run() {
-        assert_eq!(downstream_tier_name(5), "jev");
-        assert_eq!(downstream_tier_name(6), "llm");
+    fn terminal_strategy_names_are_distinct_from_provider_names() {
+        assert_eq!(Strategy::Decision.as_str(), "decision");
+        assert_eq!(Strategy::Generative.as_str(), "generative");
     }
 
     #[test]

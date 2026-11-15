@@ -127,6 +127,9 @@ fn resolve_instance_params(
             resolved.endpoint = Some(endpoint);
             resolved.timeout_ms = Some(u64::try_from(timeout.as_millis())?);
         }
+        Strategy::Decision | Strategy::Generative => {
+            return Err(format!("terminal strategy {} cannot be registered as a cascade tier", tier.strategy.as_str()).into());
+        }
     }
     Ok(resolved)
 }
@@ -302,9 +305,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         tier2_enabled = config.router.tier2.enabled,
         tier3_enabled = config.router.tier3.enabled,
         tier4_enabled = config.router.tier4.enabled,
-        tier5_enabled = config.router.tier5.enabled,
-        tier6_enabled = config.router.tier6.enabled,
-        "configured tier status"
+        decision_enabled = config.router.decision.enabled,
+        generative_enabled = config.router.generative.enabled,
+        "configured strategy status"
     );
     tracing::debug!(verbose, "startup verbosity configured");
 
@@ -426,21 +429,45 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cascade = Arc::new(CascadeRunner::new(execution_graph));
     let legacy = Arc::new(pipeline_config.legacy.clone());
 
-    let downstream_timeout =
-        Duration::from_millis(env_or("DOWNSTREAM_TIMEOUT_MS", "120000").parse()?);
-    let dispatcher = DownstreamDispatcher::new_with_enabled(
-        env_or(
-            "TIER5_ENDPOINT",
-            &env_or("TIER4_ENDPOINT", "http://127.0.0.1:11435/api/decide"),
+    let default_execution_timeout_ms: u64 =
+        env_or("DOWNSTREAM_TIMEOUT_MS", "120000").parse()?;
+    let decision_endpoint = env_or(
+        "DECISION_ENDPOINT",
+        config.router.decision.endpoint.as_deref().unwrap_or("http://127.0.0.1:11435/api/decide"),
+    );
+    let decision_model = env_or(
+        "DECISION_MODEL",
+        config.router.decision.model.as_deref().unwrap_or("laya:en"),
+    );
+    let generative_endpoint = env_or(
+        "GENERATIVE_ENDPOINT",
+        &env_or(
+            "OLLAMA_GENERATE_URL",
+            config.router.generative.endpoint.as_deref().unwrap_or("http://127.0.0.1:11434/api/generate"),
         ),
-        env_or("OLLAMA_GENERATE_URL", "http://127.0.0.1:11434/api/generate"),
-        env_or("GEMMA_MODEL", "gemma3:latest"),
-        downstream_timeout,
+    );
+    let generative_model = env_or(
+        "GENERATIVE_MODEL",
+        &env_or("GEMMA_MODEL", config.router.generative.model.as_deref().unwrap_or("gemma3:latest")),
+    );
+    let decision_timeout = Duration::from_millis(
+        config.router.decision.timeout_ms.unwrap_or(default_execution_timeout_ms),
+    );
+    let generative_timeout = Duration::from_millis(
+        config.router.generative.timeout_ms.unwrap_or(default_execution_timeout_ms),
+    );
+    let dispatcher = DownstreamDispatcher::new_with_enabled(
+        decision_endpoint,
+        decision_model,
+        generative_endpoint,
+        generative_model,
+        decision_timeout,
+        generative_timeout,
         3,
         Duration::from_secs(30),
         Duration::from_secs(30),
-        config.router.tier5.enabled,
-        config.router.tier6.enabled,
+        config.router.decision.enabled,
+        config.router.generative.enabled,
     )?;
 
     let clickhouse_url = env_or("CLICKHOUSE_URL", "http://127.0.0.1:8123");

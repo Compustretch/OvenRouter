@@ -1,17 +1,17 @@
-// src/router/tier6_runner.rs
+// src/router/generative_runner.rs
 
-use super::tier5_runner::DownstreamError;
+use super::downstream::DownstreamError;
 use serde_json::Value;
 use std::time::{Duration, Instant};
 
 #[derive(Clone)]
-pub struct Tier6Runner {
+pub struct GenerativeRunner {
     client: reqwest::Client,
     endpoint: String,
     model: String,
 }
 
-impl Tier6Runner {
+impl GenerativeRunner {
     pub fn new(endpoint: String, model: String, timeout: Duration) -> Result<Self, reqwest::Error> {
         let client = reqwest::Client::builder().timeout(timeout).build()?;
         Ok(Self {

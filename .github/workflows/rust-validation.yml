@@ -1,4 +1,4 @@
-name: Rust validation
+name: Rust and ClickHouse validation
 
 on:
   pull_request:
@@ -9,7 +9,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: rust-validation-${{ github.ref }}
+  group: validation-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
@@ -27,3 +27,27 @@ jobs:
         env:
           RUSTFLAGS: -D warnings
         run: cargo test --all-targets
+
+  clickhouse-migrations:
+    runs-on: ubuntu-latest
+    services:
+      clickhouse:
+        image: clickhouse/clickhouse-server:25.3
+        ports:
+          - 8123:8123
+    steps:
+      - uses: actions/checkout@v4
+      - name: Wait for ClickHouse
+        run: |
+          for attempt in $(seq 1 60); do
+            if curl --silent --fail http://127.0.0.1:8123/ping; then
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "ClickHouse did not become ready" >&2
+          exit 1
+      - name: Run clean-install and historical migration smoke
+        env:
+          CLICKHOUSE_URL: http://127.0.0.1:8123
+        run: bash tests/clickhouse/migration-smoke.sh
