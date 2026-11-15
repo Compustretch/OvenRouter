@@ -12,7 +12,7 @@ use axum::{
     Json, Router,
 };
 use chrono::Utc;
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer};
 use serde_json::{json, Map, Value};
 use tokio::sync::mpsc;
 use tracing::warn;
@@ -87,7 +87,7 @@ struct RequestContext {
 
 #[derive(Deserialize)]
 pub struct CompletionRequest {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_request_id")]
     request_id: Option<Uuid>,
     prompt: Option<String>,
     messages: Option<Vec<ChatMessage>>,
@@ -169,6 +169,13 @@ async fn completion(
 
     let response = complete(state, request, &request_context).await;
     attach_request_id(response, &request_context)
+}
+
+fn deserialize_request_id<'de, D>(deserializer: D) -> Result<Option<Uuid>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Uuid::deserialize(deserializer).map(Some)
 }
 
 fn resolve_request_context(
@@ -1061,6 +1068,33 @@ mod tests {
             &context,
         );
         assert_eq!(response.headers().get("x-request-id").unwrap().to_str().unwrap(), id.to_string());
+    }
+
+    #[test]
+    fn explicit_null_json_request_id_is_rejected() {
+        let parsed = serde_json::from_value::<CompletionRequest>(json!({
+            "request_id": null,
+            "prompt": "body compatibility"
+        }));
+        assert!(parsed.is_err());
+    }
+
+    #[tokio::test]
+    async fn concurrent_request_contexts_keep_distinct_ids() {
+        let first_id = Uuid::parse_str("123e4567-e89b-42d3-a456-426614174000").unwrap();
+        let second_id = Uuid::parse_str("123e4567-e89b-42d3-a456-426614174001").unwrap();
+        let mut first_headers = HeaderMap::new();
+        first_headers.insert("x-request-id", HeaderValue::from_str(&first_id.to_string()).unwrap());
+        let mut second_headers = HeaderMap::new();
+        second_headers.insert("x-request-id", HeaderValue::from_str(&second_id.to_string()).unwrap());
+
+        let (first, second) = tokio::join!(
+            async { resolve_request_context(&first_headers, None).unwrap() },
+            async { resolve_request_context(&second_headers, None).unwrap() },
+        );
+        assert_eq!(first.request_id, first_id);
+        assert_eq!(second.request_id, second_id);
+        assert_ne!(first.request_id, second.request_id);
     }
 
 }
