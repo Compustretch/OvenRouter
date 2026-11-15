@@ -453,11 +453,11 @@ mod tests {
     fn named_config() -> &'static str {
         r#"
             [task.route]
-            cascade = ["rules", "modernbert", "harrier"]
+            cascade = ["rules", "encoder"]
             labels = ["jev_capable", "needs_llm"]
             fallback_label = "needs_llm"
             [task.tag]
-            cascade = ["modernbert", "harrier"]
+            cascade = ["encoder"]
             labels = ["engineering", "help_desk"]
             fallback = "defer"
 
@@ -466,25 +466,19 @@ mod tests {
             executor = "rules"
             transport = "in_process"
             [[tier]]
-            name = "modernbert"
+            name = "encoder"
             executor = "encoder"
+            model = "modernbert-onnx"
             model_format = "onnx"
             transport = "grpc"
             request_shape = "score_tasks"
             endpoint = "http://127.0.0.1:50052"
-            [[tier]]
-            name = "harrier"
-            executor = "encoder"
-            model_format = "gguf"
-            transport = "grpc"
-            request_shape = "score_tasks"
-            endpoint = "http://127.0.0.1:50051"
 
             [tier_policy.rules.route]
             min_confidence = 0.78
-            [tier_policy.modernbert.route]
+            [tier_policy.encoder.route]
             min_confidence = 0.95
-            [tier_policy.modernbert.tag]
+            [tier_policy.encoder.tag]
             min_confidence = 0.85
         "#
     }
@@ -501,12 +495,12 @@ mod tests {
         let tag_names: Vec<_> = tag.cascade.tiers().iter().map(TierName::as_str).collect();
         let graph_names: Vec<_> = graph.order().iter()
             .map(|id| graph.tier_name(id).unwrap().as_str()).collect();
-        assert_eq!(route_names, ["rules", "modernbert", "harrier"]);
-        assert_eq!(tag_names, ["modernbert", "harrier"]);
-        assert_eq!(graph_names, ["rules", "modernbert", "harrier"]);
-        let modernbert = graph.id_for_name(&TierName::new("modernbert").unwrap()).unwrap();
-        assert!(graph.task_uses("route", &modernbert));
-        assert!(graph.task_uses("tag", &modernbert));
+        assert_eq!(route_names, ["rules", "encoder"]);
+        assert_eq!(tag_names, ["encoder"]);
+        assert_eq!(graph_names, ["rules", "encoder"]);
+        let encoder = graph.id_for_name(&TierName::new("encoder").unwrap()).unwrap();
+        assert!(graph.task_uses("route", &encoder));
+        assert!(graph.task_uses("tag", &encoder));
     }
 
     #[test]
@@ -569,7 +563,7 @@ mod tests {
     fn disabled_instances_are_omitted_from_task_paths_without_reordering() {
         let cfg = parse(named_config()).unwrap();
         let entries = cfg.tiers.iter()
-            .filter(|(name, _, _)| name.as_str() == "harrier" || name.as_str() == "rules")
+            .filter(|(name, _, _)| name.as_str() == "encoder" || name.as_str() == "rules")
             .map(|(name, tier, params)| (
                 name.clone(), *tier, params.clone(), Arc::new(Silent) as Arc<dyn FakeEvaluate>,
             ))
@@ -578,7 +572,7 @@ mod tests {
         let tasks = cfg.tasks(&registry).unwrap();
         let route = tasks.iter().find(|task| task.name == "route").unwrap();
         let names: Vec<_> = route.cascade.tiers().iter().map(TierName::as_str).collect();
-        assert_eq!(names, ["rules", "harrier"]);
+        assert_eq!(names, ["rules", "encoder"]);
     }
 
     #[test]
