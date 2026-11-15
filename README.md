@@ -1,6 +1,5 @@
-<h1 align="center">WILL IT JEV? </h1>
+<h1 align="center">OvenRouter </h1>
 
-![Polyglot UI](/assets/will-it-jev.jpeg)
 
 ## Cascade Router Engine
 
