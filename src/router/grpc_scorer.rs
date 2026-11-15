@@ -1,37 +1,74 @@
-// src/router/tier3_runner.rs
-//
-// Generic gRPC client for task-scoring sidecars. Tier 3 (ModernBERT), Tier 4
-// (Harrier), and any compatible future sidecar use this same wire-protocol
-// implementation. It returns raw predictions; task policies resolve them.
+//! One gRPC transport adapter serves multiple named encoder instances.
+//!
+//! Concrete model selection belongs to each named tier declaration and flows
+//! through its instance parameters into this client. The adapter has no tier
+//! number semantics; tier identity and execution order belong to the registry
+//! and task cascade.
 
 use std::time::Duration;
 
 use tokio::time::timeout;
 use tonic::transport::Channel;
 
-use crate::pipeline::task::{OutputKind, TaskProfile};
+use crate::pipeline::task::{OutputKind, Task};
 
 use super::tier3_proto::{
     tier3_scorer_client::Tier3ScorerClient, ScoreRequest, ScoreTasksRequest,
     ScoreTasksResponse, TaskLabel, TaskSpec,
 };
 
+/// Formats model-specific RPC requests. The concrete model is selected by the
+/// tier declaration and travels with every request as transport metadata.
 #[derive(Clone)]
-pub struct Tier3Runner {
+struct ModelFormatter {
+    model_id: tonic::metadata::MetadataValue<tonic::metadata::Ascii>,
+}
+
+impl ModelFormatter {
+    fn new(model: &str) -> Result<Self, Box<dyn std::error::Error>> {
+        Ok(Self { model_id: model.parse()? })
+    }
+
+    fn attach<T>(&self, mut request: tonic::Request<T>) -> tonic::Request<T> {
+        request.metadata_mut().insert("x-jev-model", self.model_id.clone());
+        request
+    }
+
+    fn score(&self, prompt: &str) -> tonic::Request<ScoreRequest> {
+        self.attach(tonic::Request::new(ScoreRequest { prompt: prompt.to_string() }))
+    }
+
+    fn score_tasks(
+        &self,
+        prompt: &str,
+        tasks: Vec<String>,
+        task_specs: Vec<TaskSpec>,
+    ) -> tonic::Request<ScoreTasksRequest> {
+        self.attach(tonic::Request::new(ScoreTasksRequest {
+            prompt: prompt.to_string(), tasks, task_specs,
+        }))
+    }
+}
+
+#[derive(Clone)]
+pub struct GrpcScorerClient {
     client: Tier3ScorerClient<Channel>,
+    formatter: ModelFormatter,
     max_call: Duration,
 }
 
-impl Tier3Runner {
+impl GrpcScorerClient {
     /// `connect_lazy` lets the application start when a sidecar is unavailable;
     /// connectivity faults are surfaced as per-request pass-through results.
     pub fn new(
         endpoint: String,
+        model: &str,
         max_call: Duration,
-    ) -> Result<Self, tonic::codegen::http::uri::InvalidUri> {
+    ) -> Result<Self, Box<dyn std::error::Error>> {
         let channel = Channel::from_shared(endpoint)?.connect_lazy();
         Ok(Self {
             client: Tier3ScorerClient::new(channel),
+            formatter: ModelFormatter::new(model)?,
             max_call,
         })
     }
@@ -48,9 +85,7 @@ impl Tier3Runner {
         }
         let deadline = budget.min(self.max_call);
         let mut client = self.client.clone();
-        let request = ScoreRequest {
-            prompt: prompt.to_string(),
-        };
+        let request = self.formatter.score(prompt);
         match timeout(deadline, client.score(request)).await {
             Err(_) => Err("timeout"),
             Ok(Err(_)) => Err("rpc_error"),
@@ -69,7 +104,7 @@ impl Tier3Runner {
     pub async fn score_tasks(
         &self,
         prompt: &str,
-        profiles: &[TaskProfile],
+        profiles: &[Task],
         budget: Duration,
     ) -> Result<ScoreTasksResponse, TasksError> {
         if budget.is_zero() {
@@ -77,7 +112,7 @@ impl Tier3Runner {
         }
         let deadline = budget.min(self.max_call);
         let mut client = self.client.clone();
-        let tasks = profiles.iter().map(|profile| profile.task.as_str().to_string()).collect();
+        let tasks = profiles.iter().map(|profile| profile.name.as_str().to_string()).collect();
         let task_specs = profiles.iter().map(|profile| {
             let labels = profile.labels.as_deref().unwrap_or_default().iter().map(|label| {
                 if let Some(metadata) = profile.label_metadata.iter().find(|item| item.id.as_str() == label.as_str()) {
@@ -105,17 +140,13 @@ impl Tier3Runner {
                 OutputKind::Ordinal => 4,
             };
             TaskSpec {
-                task: profile.task.as_str().to_string(),
+                task: profile.name.as_str().to_string(),
                 output_kind,
                 labels,
                 taxonomy_version: profile.taxonomy_version.clone().unwrap_or_default(),
             }
         }).collect();
-        let request = ScoreTasksRequest {
-            prompt: prompt.to_string(),
-            tasks,
-            task_specs,
-        };
+        let request = self.formatter.score_tasks(prompt, tasks, task_specs);
         match timeout(deadline, client.score_tasks(request)).await {
             Err(_) => Err(TasksError::Fault("timeout")),
             Ok(Err(status)) if status.code() == tonic::Code::Unimplemented => {
