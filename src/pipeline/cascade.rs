@@ -525,7 +525,21 @@ mod tests {
         ];
         let graph = CascadeGraph::from_tasks(&tasks, &registry).unwrap();
 
+        // The shared transition contributes one edge to the union order, not
+        // one edge per task. Its provenance still records both task paths.
+        let ordered_names: Vec<_> = graph.order().iter()
+            .map(|id| graph.tier_name(id).unwrap().as_str()).collect();
+        assert_eq!(ordered_names, ["alpha", "beta"]);
+
         let dependencies: Vec<_> = graph.dependencies().collect();
+        let expected_from_provenance: Vec<_> = graph.progression_edges.iter()
+            .map(|((from, to), tasks)| CascadeDependency {
+                from: *from,
+                to: *to,
+                tasks: tasks.clone(),
+            })
+            .collect();
+        assert_eq!(dependencies, expected_from_provenance);
         assert_eq!(dependencies.len(), 1);
         assert_eq!(dependencies[0].from, graph.id_for_name(&tname("alpha")).unwrap());
         assert_eq!(dependencies[0].to, graph.id_for_name(&tname("beta")).unwrap());
@@ -586,10 +600,21 @@ mod tests {
             singleton_graph.id_for_name(&tname("beta")).unwrap(),
         ].into_iter().collect();
         assert_eq!(tiers.into_iter().collect::<BTreeSet<_>>(), expected_cycle_tiers);
-        assert_eq!(blocked_dependencies.len(), 4);
+
+        let alpha = singleton_graph.id_for_name(&tname("alpha")).unwrap();
         let beta = singleton_graph.id_for_name(&tname("beta")).unwrap();
         let gamma = singleton_graph.id_for_name(&tname("gamma")).unwrap();
-        assert!(blocked_dependencies.iter().any(|edge| edge.from == beta && edge.to == gamma));
+        let delta = singleton_graph.id_for_name(&tname("delta")).unwrap();
+        let actual_blocked: BTreeMap<_, _> = blocked_dependencies.into_iter()
+            .map(|edge| ((edge.from, edge.to), edge.tasks))
+            .collect();
+        let expected_blocked = BTreeMap::from([
+            ((alpha, beta), BTreeSet::from(["forward".to_string()])),
+            ((beta, alpha), BTreeSet::from(["reverse".to_string()])),
+            ((beta, gamma), BTreeSet::from(["downstream".to_string()])),
+            ((gamma, delta), BTreeSet::from(["downstream".to_string()])),
+        ]);
+        assert_eq!(actual_blocked, expected_blocked);
     }
 
     #[test]
