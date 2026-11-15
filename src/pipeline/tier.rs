@@ -395,6 +395,7 @@ impl TierInstance {
                 let timeout_ms = params.timeout_ms
                     .ok_or_else(|| format!("tier {name}: encoder tier has no timeout_ms"))?;
                 let model = params.model.as_deref()
+                    .filter(|model| !model.trim().is_empty())
                     .ok_or_else(|| format!("tier {name}: encoder tier has no concrete model selection"))?;
                 (Runner::Grpc(Tier3Runner::new(
                     endpoint,
