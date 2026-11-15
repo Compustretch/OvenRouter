@@ -24,7 +24,7 @@ struct ModelFormatter {
 }
 
 impl ModelFormatter {
-    fn new(model: &str) -> Result<Self, tonic::metadata::errors::InvalidMetadataValue> {
+    fn new(model: &str) -> Result<Self, Box<dyn std::error::Error>> {
         Ok(Self { model_id: model.parse()? })
     }
 
