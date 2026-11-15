@@ -9,8 +9,8 @@
 //   TierInstance  a Tier plus resolved instance parameters, loaded artifacts, and runner.
 //                 Cascade assigns its TierId using TierInstance::derive_id.
 //
-// A tier returns raw readings for the task IDs it can serve; all task-specific
-// acceptance policy lives outside this module.
+// A tier returns raw readings for the task IDs it can serve; (?)
+// all task-specific acceptance policy lives outside this module.
 
 use std::collections::BTreeMap;
 use std::error::Error;
@@ -356,7 +356,7 @@ impl<'de> Deserialize<'de> for TierId {
 // ---- instance --------------------------------------------------------------
 
 /// A Tier plus the parameters that distinguish this instance, loaded and ready to
-/// evaluate. The registry stores instances by TierName; CascadeGraph derives TierId.
+/// evaluate. 
 pub struct TierInstance {
     name: TierName,
     tier: Tier,
