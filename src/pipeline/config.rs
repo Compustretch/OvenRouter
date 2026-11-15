@@ -84,7 +84,7 @@ fn default_tier_configs() -> Vec<TierConfig> {
     ].into_iter().map(|(name, role, transport, request_shape, model_format)| (
         TierName::new(name).expect("built-in tier names are valid"),
         Tier { exex: role, transport, request_shape },
-        Params { model_format, model: None, config: None, endpoint: None, timeout_ms: None, enabled: None },
+        Params { model_format, model: match model_format { Some(ModelFormat::Onnx) => Some("modernbert-onnx".into()), Some(ModelFormat::Gguf) => Some("harrier-270m".into()), None => None }, config: None, endpoint: None, timeout_ms: None, enabled: None },
     )).collect()
 
 }
