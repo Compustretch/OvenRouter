@@ -14,6 +14,19 @@ class Tier3Servicer(tier3_pb2_grpc.Tier3ScorerServicer):
         self.calibration = calibration
         self.model_id = model_id
 
+    def _assert_requested_model(self, context):
+        requested = dict(context.invocation_metadata()).get("x-jev-model")
+        if not requested:
+            context.abort(
+                grpc.StatusCode.INVALID_ARGUMENT,
+                "missing x-jev-model metadata; the encoder tier must select a concrete model",
+            )
+        if requested != self.model_id:
+            context.abort(
+                grpc.StatusCode.FAILED_PRECONDITION,
+                f"encoder model mismatch: request selected {requested!r}, sidecar serves {self.model_id!r}",
+            )
+
     def _route(self, prompt):
         output = self.model.score(prompt)
         # ModernBERT's compatibility adapter already returns calibrated
@@ -35,6 +48,7 @@ class Tier3Servicer(tier3_pb2_grpc.Tier3ScorerServicer):
         return raw, confidence, label, scores
 
     def Score(self, request, context):
+        self._assert_requested_model(context)
         try:
             raw, confidence, label, _ = self._route(request.prompt)
         except Exception as error:
@@ -48,6 +62,7 @@ class Tier3Servicer(tier3_pb2_grpc.Tier3ScorerServicer):
 
     def ScoreTasks(self, request, context):
         """Run every requested head over one model-owned shared representation."""
+        self._assert_requested_model(context)
         specs = {spec.task: spec for spec in request.task_specs}
         requested = list(request.tasks) or [spec.task for spec in request.task_specs]
         tasks = list(dict.fromkeys(requested))
