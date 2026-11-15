@@ -79,12 +79,11 @@ fn default_tier_configs() -> Vec<TierConfig> {
     [
         ("rules", Role::Rules, Transport::InProcess, None, None),
         ("fasttext", Role::FastText, Transport::InProcess, None, None),
-        ("modernbert", Role::Encoder, Transport::Grpc, Some(RequestShape::Score), Some(ModelFormat::Onnx)),
-        ("harrier", Role::Encoder, Transport::Grpc, Some(RequestShape::Score), Some(ModelFormat::Gguf)),
+        ("encoder", Role::Encoder, Transport::Grpc, Some(RequestShape::ScoreTasks), Some(ModelFormat::Onnx)),
     ].into_iter().map(|(name, role, transport, request_shape, model_format)| (
         TierName::new(name).expect("built-in tier names are valid"),
         Tier { exex: role, transport, request_shape },
-        Params { model_format, model: None, config: None, endpoint: None, timeout_ms: None, enabled: None },
+        Params { model_format, model: if role == Role::Encoder { Some("modernbert-onnx".into()) } else { None }, config: None, endpoint: None, timeout_ms: None, enabled: None },
     )).collect()
 
 }
@@ -102,6 +101,9 @@ fn tier_configs_from(raw: Vec<RawTier>) -> Result<Vec<TierConfig>, Box<dyn Error
         definition.validate().map_err(|reason| format!("[[tier]] {label:?}: {reason}"))?;
         if definition.exex == Role::Encoder && tier.model_format.is_none() {
             return Err(format!("[[tier]] {label:?}: encoder must declare model_format (onnx or gguf)").into());
+        }
+        if definition.exex == Role::Encoder && tier.model.as_deref().is_none_or(str::is_empty) {
+            return Err(format!("[[tier]] {label:?}: encoder must declare a concrete model identifier in `model`").into());
         }
         if !definition.accepts(tier.model_format) {
             return Err(format!("[[tier]] {label:?}: model_format {:?} is incompatible with {} executor", tier.model_format.map(ModelFormat::as_str), definition.exex.as_str()).into());
@@ -150,7 +152,7 @@ fn find_tier<'a>(tiers: &'a [TierConfig], legacy: &LegacyTierNumbers, reference:
 }
 
 /// The compatibility numbering: `[legacy_tiers]` if present; otherwise the
-/// original four-tier numbering when no `[[tier]]` is declared; otherwise none.
+/// default rules/fastText/encoder numbering when no `[[tier]]` is declared.
 fn legacy_numbers_from(
     declared: Option<BTreeMap<String, u8>>,
     tiers: &[TierConfig],
@@ -160,7 +162,7 @@ fn legacy_numbers_from(
         return Ok(if has_explicit_tier_registry {
             LegacyTierNumbers::default()
         } else {
-            LegacyTierNumbers::original_four()
+            LegacyTierNumbers::original_three()
         });
     };
     let mut pairs = Vec::with_capacity(declared.len());
@@ -453,11 +455,11 @@ mod tests {
     fn named_config() -> &'static str {
         r#"
             [task.route]
-            cascade = ["rules", "modernbert", "harrier"]
+            cascade = ["rules", "encoder"]
             labels = ["jev_capable", "needs_llm"]
             fallback_label = "needs_llm"
             [task.tag]
-            cascade = ["modernbert", "harrier"]
+            cascade = ["encoder"]
             labels = ["engineering", "help_desk"]
             fallback = "defer"
 
@@ -466,25 +468,19 @@ mod tests {
             executor = "rules"
             transport = "in_process"
             [[tier]]
-            name = "modernbert"
+            name = "encoder"
             executor = "encoder"
+            model = "modernbert-onnx"
             model_format = "onnx"
             transport = "grpc"
             request_shape = "score_tasks"
             endpoint = "http://127.0.0.1:50052"
-            [[tier]]
-            name = "harrier"
-            executor = "encoder"
-            model_format = "gguf"
-            transport = "grpc"
-            request_shape = "score_tasks"
-            endpoint = "http://127.0.0.1:50051"
 
             [tier_policy.rules.route]
             min_confidence = 0.78
-            [tier_policy.modernbert.route]
+            [tier_policy.encoder.route]
             min_confidence = 0.95
-            [tier_policy.modernbert.tag]
+            [tier_policy.encoder.tag]
             min_confidence = 0.85
         "#
     }
@@ -501,12 +497,28 @@ mod tests {
         let tag_names: Vec<_> = tag.cascade.tiers().iter().map(TierName::as_str).collect();
         let graph_names: Vec<_> = graph.order().iter()
             .map(|id| graph.tier_name(id).unwrap().as_str()).collect();
-        assert_eq!(route_names, ["rules", "modernbert", "harrier"]);
-        assert_eq!(tag_names, ["modernbert", "harrier"]);
-        assert_eq!(graph_names, ["rules", "modernbert", "harrier"]);
-        let modernbert = graph.id_for_name(&TierName::new("modernbert").unwrap()).unwrap();
-        assert!(graph.task_uses("route", &modernbert));
-        assert!(graph.task_uses("tag", &modernbert));
+        assert_eq!(route_names, ["rules", "encoder"]);
+        assert_eq!(tag_names, ["encoder"]);
+        assert_eq!(graph_names, ["rules", "encoder"]);
+        let encoder = graph.id_for_name(&TierName::new("encoder").unwrap()).unwrap();
+        assert!(graph.task_uses("route", &encoder));
+        assert!(graph.task_uses("tag", &encoder));
+    }
+
+    #[test]
+    fn encoder_declaration_requires_a_concrete_model_identifier() {
+        let result = parse(r#"
+            [task.route]
+            cascade = ["encoder"]
+            fallback_label = "needs_llm"
+            [[tier]]
+            name = "encoder"
+            executor = "encoder"
+            model_format = "onnx"
+            transport = "grpc"
+            request_shape = "score_tasks"
+        "#);
+        assert!(result.is_err_and(|error| error.to_string().contains("concrete model identifier")));
     }
 
     #[test]
@@ -523,10 +535,10 @@ mod tests {
     }
 
     #[test]
-    fn legacy_config_defaults_each_task_to_the_original_four_tiers() {
+    fn legacy_config_defaults_each_task_to_rules_fasttext_and_one_encoder() {
         let cfg = parse("[task.route]\nfallback_label = \"needs_llm\"").unwrap();
         let names: Vec<_> = cfg.profiles["route"].cascade.tiers().iter().map(TierName::as_str).collect();
-        assert_eq!(names, ["rules", "fasttext", "modernbert", "harrier"]);
+        assert_eq!(names, ["rules", "fasttext", "encoder"]);
     }
 
     #[test]
@@ -569,7 +581,7 @@ mod tests {
     fn disabled_instances_are_omitted_from_task_paths_without_reordering() {
         let cfg = parse(named_config()).unwrap();
         let entries = cfg.tiers.iter()
-            .filter(|(name, _, _)| name.as_str() == "harrier" || name.as_str() == "rules")
+            .filter(|(name, _, _)| name.as_str() == "encoder" || name.as_str() == "rules")
             .map(|(name, tier, params)| (
                 name.clone(), *tier, params.clone(), Arc::new(Silent) as Arc<dyn FakeEvaluate>,
             ))
@@ -578,7 +590,7 @@ mod tests {
         let tasks = cfg.tasks(&registry).unwrap();
         let route = tasks.iter().find(|task| task.name == "route").unwrap();
         let names: Vec<_> = route.cascade.tiers().iter().map(TierName::as_str).collect();
-        assert_eq!(names, ["rules", "harrier"]);
+        assert_eq!(names, ["rules", "encoder"]);
     }
 
     #[test]
