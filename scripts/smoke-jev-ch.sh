@@ -38,10 +38,8 @@ source "$AUTH_FILE"
 set +a
 : "${CLICKHOUSE_USER:?CLICKHOUSE_USER missing from .auth}"
 : "${CLICKHOUSE_PASSWORD:?CLICKHOUSE_PASSWORD missing from .auth}"
-CH_AUTH=(--user "${CLICKHOUSE_USER}:${CLICKHOUSE_PASSWORD}")
-
 ch_query() {
-    curl -sS --fail-with-body "${CH_AUTH[$]}" \
+    curl -sS --fail-with-body --user "${CLICKHOUSE_USER}:${CLICKHOUSE_PASSWORD}" \
         --get --data-urlencode "query=$1" "${CLICKHOUSE_URL}/"
 }
 
