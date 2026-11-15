@@ -7,12 +7,12 @@ tag_in_request = false
 tag_budget_ms = 4000
 
 [task.route]
-cascade = ["rules", "fasttext", "modernbert", "harrier"]
+cascade = ["rules", "fasttext", "encoder"]
 labels = ["jev_capable", "needs_llm"]
 fallback_label = "needs_llm"
 
 [task.tag]
-cascade = ["modernbert", "harrier"]
+cascade = ["encoder"]
 output_kind = "multiclass"
 taxonomy = "../taskonomies/help_desk.json"
 fallback = "defer"
@@ -24,9 +24,9 @@ fallback = "defer"
 #   executor     which executor handles the tier: rules | fasttext | encoder
 #   transport    how the router reaches it: in_process | grpc
 #   request_shape  encoder only: the RPC contract, score | score_tasks
-#   model_format  encoder inference runtime: onnx | gguf; selects the adapter
-#   model        fasttext: model file; encoder: opaque instance configuration
-#                included in the hash-derived TierId
+#   model_format  encoder model serialization/runtime: onnx | gguf
+#   model        fasttext: model file; encoder: concrete model identifier served
+#                by the selected sidecar, passed through the transport
 #   config       rules: rule file
 #
 # `model` / `config` fall back to FASTTEXT_MODEL / TIER1_CONFIG for a definition
@@ -43,18 +43,12 @@ executor = "fasttext"
 transport = "in_process"
 
 [[tier]]
-name = "modernbert"
+name = "encoder"
 executor = "encoder"
+model = "modernbert-onnx"
 model_format = "onnx"
 transport = "grpc"
-request_shape = "score"
-
-[[tier]]
-name = "harrier"
-executor = "encoder"
-model_format = "gguf"
-transport = "grpc"
-request_shape = "score"
+request_shape = "score_tasks"
 
 # Compatibility only. Before tiers had names the original four were numbered;
 # the numbered telemetry fields (tier1_outcome .. tier4_outcome,
@@ -65,8 +59,7 @@ request_shape = "score"
 [legacy_tiers]
 rules = 1
 fasttext = 2
-modernbert = 3
-harrier = 4
+encoder = 3
 
 # Calibration belongs to a tier name + task pair. A policy may record the
 # instance it was fitted on with `calibrated_for = "<TierId, 32 hex>"`; the
@@ -82,15 +75,12 @@ never_resolve = ["needs_llm"]
 min_confidence = 0.95
 never_resolve = ["needs_llm"]
 
-[tier_policy.modernbert.route]
+[tier_policy.encoder.route]
 min_confidence = 0.95
 label_min_confidence = { jev_capable = 0.95, needs_llm = 0.70 }
 
-[tier_policy.harrier.route]
-min_confidence = 0.95
-label_min_confidence = { jev_capable = 0.95, needs_llm = 0.70 }
 
 # To evaluate route and tag heads in one ScoreTasks call, change the relevant
 # tier's request_shape to "score_tasks" and add its tag policy:
-# [tier_policy.modernbert.tag]
-# min_confidence = 0.85
+[tier_policy.encoder.tag]
+min_confidence = 0.85
