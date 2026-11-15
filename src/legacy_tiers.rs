@@ -62,8 +62,8 @@ mod tests {
 
     #[test]
     fn a_name_and_a_number_look_each_other_up() {
-        let map = LegacyTierNumbers::new([(tname("rules"), 1), (tname("modernbert"), 3)]).unwrap();
-        assert_eq!(map.ordinal_of(&tname("modernbert")), Some(3));
+        let map = LegacyTierNumbers::new([(tname("rules"), 1), (tname("encoder"), 3)]).unwrap();
+        assert_eq!(map.ordinal_of(&tname("encoder")), Some(3));
         assert_eq!(map.ordinal_of(&tname("prefilter")), None);
         assert_eq!(map.name_of(1), Some(&tname("rules")));
         assert_eq!(map.name_of(2), None);
