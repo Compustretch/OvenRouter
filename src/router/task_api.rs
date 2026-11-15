@@ -365,7 +365,7 @@ mod tests {
         cascade::{Cascade, CascadeGraph},
         registry::TierRegistry,
         task::{FallbackPolicy, OutputKind, Reading, TierPolicy},
-        tier::{tname, FakeEvaluate, ModelFormat, Params, RequestShape, Role, Tier, TierContext, TierName, TierOutput, Transport},
+        tier::{tname, FakeEvaluate, ModelFormat, Params, RequestShape, Strategy, Tier, TierContext, TierName, TierOutput, Transport},
     };
     use async_trait::async_trait;
     use std::collections::BTreeMap;
@@ -406,19 +406,19 @@ mod tests {
 
     fn fake_entry(
         name: &str,
-        role: Role,
+        strategy: Strategy,
         fake: Arc<dyn FakeEvaluate>,
     ) -> (TierName, Tier, Params, Arc<dyn FakeEvaluate>) {
         let (transport, request_shape, model_format, model, config, endpoint, timeout_ms) =
-            match role {
-                Role::Rules => (Transport::InProcess, None, None, None, Some("test-rules".into()), None, None),
-                Role::FastText => (Transport::InProcess, None, None, Some("test-fasttext".into()), None, None, None),
-                Role::Encoder => (Transport::Grpc, Some(RequestShape::Score), Some(ModelFormat::Onnx),
+            match strategy {
+                Strategy::Rules => (Transport::InProcess, None, None, None, Some("test-rules".into()), None, None),
+                Strategy::FastText => (Transport::InProcess, None, None, Some("test-fasttext".into()), None, None, None),
+                Strategy::Encoder => (Transport::Grpc, Some(RequestShape::Score), Some(ModelFormat::Onnx),
                     Some(name.into()), None, Some("http://127.0.0.1:9".into()), Some(250)),
             };
         (
             tname(name),
-            Tier { exex: role, transport, request_shape },
+            Tier { strategy: strategy, transport, request_shape },
             Params { model_format, model, config, endpoint, timeout_ms, enabled: None },
             fake,
         )
@@ -428,14 +428,14 @@ mod tests {
     async fn arbitrary_tasks_follow_independent_paths_and_return_required_subset_first() {
         let calls = Arc::new(Mutex::new(Vec::new()));
         let registry = TierRegistry::of(vec![
-            fake_entry("rules", Role::Rules, Arc::new(FixtureTier {
+            fake_entry("rules", Strategy::Rules, Arc::new(FixtureTier {
                 name: "rules".into(),
                 delay: Duration::from_millis(5),
                 readings: [("customer_intent".into(),
                     TierReading::Scored(Reading::new("billing", 0.97)))].into(),
                 calls: calls.clone(),
             })),
-            fake_entry("modernbert", Role::Encoder, Arc::new(FixtureTier {
+            fake_entry("modernbert", Strategy::Encoder, Arc::new(FixtureTier {
                 name: "modernbert".into(),
                 delay: Duration::from_millis(300),
                 readings: [

@@ -21,7 +21,7 @@ fallback = "defer"
 # registry catalogs definitions; task cascades select which definitions the
 # CascadeGraph materializes as TierInstances with hash-derived TierIds.
 #
-#   executor     which executor handles the tier: rules | fasttext | encoder
+#   strategy     which strategy handles the tier: rules | fasttext | encoder
 #   transport    how the router reaches it: in_process | grpc
 #   request_shape  encoder only: the RPC contract, score | score_tasks
 #   model_format  encoder model serialization/runtime: onnx | gguf
@@ -35,17 +35,17 @@ fallback = "defer"
 
 [[tier]]
 name = "rules"
-executor = "rules"
+strategy = "rules"
 transport = "in_process"
 
 [[tier]]
 name = "fasttext"
-executor = "fasttext"
+strategy = "fasttext"
 transport = "in_process"
 
 [[tier]]
 name = "encoder"
-executor = "encoder"
+strategy = "encoder"
 model = "modernbert-onnx"
 model_format = "onnx"
 transport = "grpc"

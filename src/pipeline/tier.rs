@@ -2,7 +2,7 @@
 //
 // The tier ontology, and the code that evaluates it.
 //
-//   Tier          the reusable definition: a role, how it is reached, and, for an
+//   Tier          the reusable definition: a strategy, how it is reached, and, for an
 //                 encoder, which RPC contract it speaks. No instance parameters.
 //   Params        what distinguishes one instance of a Tier from another: the
 //                 model format and model, rule file, endpoint, timeout.
@@ -110,11 +110,11 @@ pub fn tname(name: &str) -> TierName {
 
 // ---- definition ------------------------------------------------------------
 
-/// What a tier is for. `Encoder` is the tier that fronts a neural encoder served
-/// by a sidecar; the same definition supports many instances, each running its
-/// own model.
+/// The evaluation strategy selected by a tier definition. `Encoder` fronts a
+/// neural encoder served by a sidecar; the same definition supports many
+/// instances, each running its own model.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
-pub enum Role {
+pub enum Strategy {
     #[serde(rename = "rules")]
     Rules,
     #[serde(rename = "fasttext")]
@@ -123,7 +123,7 @@ pub enum Role {
     Encoder,
 }
 
-impl Role {
+impl Strategy {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Rules => "rules",
@@ -166,31 +166,31 @@ impl ModelFormat {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Tier {
-    pub exex: Role,
+    pub strategy: Strategy,
     pub transport: Transport,
     /// Encoder over gRPC only.
     pub request_shape: Option<RequestShape>,
 }
 
 impl Tier {
-    /// A definition is coherent when its role, transport and request shape agree.
+    /// A definition is coherent when its strategy, transport and request shape agree.
     pub fn validate(&self) -> Result<(), &'static str> {
-        match (self.exex, self.transport, self.request_shape) {
-            (Role::Rules | Role::FastText, Transport::InProcess, None) => Ok(()),
-            (Role::Rules | Role::FastText, _, _) => {
+        match (self.strategy, self.transport, self.request_shape) {
+            (Strategy::Rules | Strategy::FastText, Transport::InProcess, None) => Ok(()),
+            (Strategy::Rules | Strategy::FastText, _, _) => {
                 Err("rules and fasttext require transport = \"in_process\" and no request_shape")
             }
-            (Role::Encoder, Transport::Grpc, Some(_)) => Ok(()),
-            (Role::Encoder, _, _) => {
+            (Strategy::Encoder, Transport::Grpc, Some(_)) => Ok(()),
+            (Strategy::Encoder, _, _) => {
                 Err("encoder requires transport = \"grpc\" and request_shape = \"score\" or \"score_tasks\"")
             }
         }
     }
 
     pub fn accepts(&self, model_format: Option<ModelFormat>) -> bool {
-        matches!((self.exex, model_format),
-            (Role::Rules | Role::FastText, None)
-                | (Role::Encoder, Some(ModelFormat::Onnx | ModelFormat::Gguf)))
+        matches!((self.strategy, model_format),
+            (Strategy::Rules | Strategy::FastText, None)
+                | (Strategy::Encoder, Some(ModelFormat::Onnx | ModelFormat::Gguf)))
     }
 }
 
@@ -311,7 +311,7 @@ pub fn hex(bytes: &[u8]) -> String {
 // ---- TierId ----------------------------------------------------------------
 
 /// Generated TierId for a concrete TierInstance. `TierInstance::derive_id`
-/// hashes its authored name, role, model format, model value and artifact hash.
+/// hashes its authored name, strategy, model format, model value and artifact hash.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct TierId([u8; 16]);
 
@@ -373,23 +373,23 @@ impl TierInstance {
     pub fn build(name: TierName, tier: Tier, params: Params) -> Result<Self, Box<dyn Error>> {
         tier.validate().map_err(|reason| format!("tier {name}: {reason}"))?;
         if !tier.accepts(params.model_format) {
-            return Err(format!("tier {name}: model_format {:?} is incompatible with {} executor", params.model_format.map(ModelFormat::as_str), tier.exex.as_str()).into());
+            return Err(format!("tier {name}: model_format {:?} is incompatible with {} strategy", params.model_format.map(ModelFormat::as_str), tier.strategy.as_str()).into());
         }
-        let (runner, artifact_hash) = match tier.exex {
-            Role::Rules => {
+        let (runner, artifact_hash) = match tier.strategy {
+            Strategy::Rules => {
                 let path = params.config.as_deref()
                     .ok_or_else(|| format!("tier {name}: rules tier has no `config` path"))?;
                 let hash = sha256_file(path)?;
                 let engine = Arc::new(Tier1Engine::new(Tier1Automaton::from_toml_file(path)?)?);
                 (Runner::Rules(engine), Some(hash))
             }
-            Role::FastText => {
+            Strategy::FastText => {
                 let path = params.model.as_deref()
                     .ok_or_else(|| format!("tier {name}: fasttext tier has no `model` path"))?;
                 let hash = sha256_file(path)?;
                 (Runner::FastText(Arc::new(Tier2Runner::new(path)?)), Some(hash))
             }
-            Role::Encoder => {
+            Strategy::Encoder => {
                 let endpoint = params.endpoint.clone()
                     .ok_or_else(|| format!("tier {name}: encoder tier has no endpoint"))?;
                 let timeout_ms = params.timeout_ms
@@ -422,7 +422,7 @@ impl TierInstance {
     }
 
     /// Derive the TierId for this instance. The hash includes its authored name,
-    /// complete tier definition (role, transport and request shape), model format,
+    /// complete tier definition (strategy, transport and request shape), model format,
     /// model value and artifact content hash. Endpoint, timeout and enabled state
     /// are deployment settings and do not contribute to the ID.
     pub fn derive_id(
@@ -439,7 +439,8 @@ impl TierInstance {
             digest.update(b"\0");
         };
         field("tier_name", name.as_str());
-        field("role", tier.exex.as_str());
+        // Keep the legacy hash-domain key stable so existing TierIds remain unchanged.
+        field("role", tier.strategy.as_str());
         field("transport", match tier.transport {
             Transport::InProcess => "in_process",
             Transport::Grpc => "grpc",
@@ -616,7 +617,7 @@ impl TierInstance {
 
     /// An encoder instance over an already-constructed gRPC runner.
     pub fn encoder(name: &str, shape: RequestShape, model: Option<&str>, runner: GrpcScorerClient) -> Self {
-        let tier = Tier { exex: Role::Encoder, transport: Transport::Grpc, request_shape: Some(shape) };
+        let tier = Tier { strategy: Strategy::Encoder, transport: Transport::Grpc, request_shape: Some(shape) };
         let params = Params {
             model_format: Some(ModelFormat::Onnx), model: model.map(str::to_string), config: None,
             endpoint: Some("http://127.0.0.1:9".into()), timeout_ms: Some(250), enabled: None,
@@ -777,7 +778,7 @@ mod tests {
     fn encoder_config(name: &str, model_format: ModelFormat, model: Option<&str>, endpoint: &str) -> (TierName, Tier, Params) {
         (
             TierName::new(name).unwrap(),
-            Tier { exex: Role::Encoder, transport: Transport::Grpc, request_shape: Some(RequestShape::Score) },
+            Tier { strategy: Strategy::Encoder, transport: Transport::Grpc, request_shape: Some(RequestShape::Score) },
             Params {
                 model_format: Some(model_format), model: model.map(str::to_string), config: None,
                 endpoint: Some(endpoint.to_string()), timeout_ms: Some(250), enabled: None,
@@ -788,7 +789,7 @@ mod tests {
     fn rules_config(name: &str, config: Option<&str>) -> (TierName, Tier, Params) {
         (
             TierName::new(name).unwrap(),
-            Tier { exex: Role::Rules, transport: Transport::InProcess, request_shape: None },
+            Tier { strategy: Strategy::Rules, transport: Transport::InProcess, request_shape: None },
             Params {
                 model_format: None, model: None, config: config.map(str::to_string),
                 endpoint: None, timeout_ms: None, enabled: None,

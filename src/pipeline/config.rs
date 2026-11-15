@@ -24,7 +24,7 @@ use crate::legacy_tiers::LegacyTierNumbers;
 use super::cascade::Cascade;
 use super::registry::TierRegistry;
 use super::tier::TierName;
-use super::tier::{ModelFormat, Params, RequestShape, Role, Tier, Transport};
+use super::tier::{ModelFormat, Params, RequestShape, Strategy, Tier, Transport};
 
 type TierConfig = (TierName, Tier, Params);
 use super::task::{FallbackPolicy, OutputKind, TaskLabelMetadata, Task, TierPolicy};
@@ -63,7 +63,7 @@ impl Default for RawPipelineSettings {
 #[serde(deny_unknown_fields)]
 struct RawTier {
     name: String,
-    executor: Role,
+    strategy: Strategy,
     transport: Transport,
     request_shape: Option<RequestShape>,
     model_format: Option<ModelFormat>,
@@ -77,13 +77,13 @@ struct RawTier {
 /// Available tier declarations. Their vector order has no scheduling meaning.
 fn default_tier_configs() -> Vec<TierConfig> {
     [
-        ("rules", Role::Rules, Transport::InProcess, None, None),
-        ("fasttext", Role::FastText, Transport::InProcess, None, None),
-        ("encoder", Role::Encoder, Transport::Grpc, Some(RequestShape::ScoreTasks), Some(ModelFormat::Onnx)),
-    ].into_iter().map(|(name, role, transport, request_shape, model_format)| (
+        ("rules", Strategy::Rules, Transport::InProcess, None, None),
+        ("fasttext", Strategy::FastText, Transport::InProcess, None, None),
+        ("encoder", Strategy::Encoder, Transport::Grpc, Some(RequestShape::ScoreTasks), Some(ModelFormat::Onnx)),
+    ].into_iter().map(|(name, strategy, transport, request_shape, model_format)| (
         TierName::new(name).expect("built-in tier names are valid"),
-        Tier { exex: role, transport, request_shape },
-        Params { model_format, model: if role == Role::Encoder { Some("modernbert-onnx".into()) } else { None }, config: None, endpoint: None, timeout_ms: None, enabled: None },
+        Tier { strategy: strategy, transport, request_shape },
+        Params { model_format, model: if strategy == Strategy::Encoder { Some("modernbert-onnx".into()) } else { None }, config: None, endpoint: None, timeout_ms: None, enabled: None },
     )).collect()
 
 }
@@ -97,25 +97,25 @@ fn tier_configs_from(raw: Vec<RawTier>) -> Result<Vec<TierConfig>, Box<dyn Error
         if tiers.iter().any(|existing| existing.0 == name) {
             return Err(format!("[[tier]] {label:?} is defined twice").into());
         }
-        let definition = Tier { exex: tier.executor, transport: tier.transport, request_shape: tier.request_shape };
+        let definition = Tier { strategy: tier.strategy, transport: tier.transport, request_shape: tier.request_shape };
         definition.validate().map_err(|reason| format!("[[tier]] {label:?}: {reason}"))?;
-        if definition.exex == Role::Encoder && tier.model_format.is_none() {
+        if definition.strategy == Strategy::Encoder && tier.model_format.is_none() {
             return Err(format!("[[tier]] {label:?}: encoder must declare model_format (onnx or gguf)").into());
         }
-        if definition.exex == Role::Encoder && tier.model.as_deref().is_none_or(str::is_empty) {
+        if definition.strategy == Strategy::Encoder && tier.model.as_deref().is_none_or(str::is_empty) {
             return Err(format!("[[tier]] {label:?}: encoder must declare a concrete model identifier in `model`").into());
         }
         if !definition.accepts(tier.model_format) {
-            return Err(format!("[[tier]] {label:?}: model_format {:?} is incompatible with {} executor", tier.model_format.map(ModelFormat::as_str), definition.exex.as_str()).into());
+            return Err(format!("[[tier]] {label:?}: model_format {:?} is incompatible with {} strategy", tier.model_format.map(ModelFormat::as_str), definition.strategy.as_str()).into());
         }
-        if definition.exex != Role::Encoder && (tier.endpoint.is_some() || tier.timeout_ms.is_some()) {
+        if definition.strategy != Strategy::Encoder && (tier.endpoint.is_some() || tier.timeout_ms.is_some()) {
             return Err(format!("[[tier]] {label:?}: endpoint/timeout_ms require grpc transport").into());
         }
-        match definition.exex {
-            Role::Rules if tier.model.is_some() => {
+        match definition.strategy {
+            Strategy::Rules if tier.model.is_some() => {
                 return Err(format!("[[tier]] {label:?}: a rules tier takes `config`, not `model`").into());
             }
-            Role::FastText | Role::Encoder if tier.config.is_some() => {
+            Strategy::FastText | Strategy::Encoder if tier.config.is_some() => {
                 return Err(format!("[[tier]] {label:?}: `config` is only valid on a rules tier").into());
             }
             _ => {}
@@ -465,11 +465,11 @@ mod tests {
 
             [[tier]]
             name = "rules"
-            executor = "rules"
+            strategy = "rules"
             transport = "in_process"
             [[tier]]
             name = "encoder"
-            executor = "encoder"
+            strategy = "encoder"
             model = "modernbert-onnx"
             model_format = "onnx"
             transport = "grpc"
@@ -513,7 +513,7 @@ mod tests {
             fallback_label = "needs_llm"
             [[tier]]
             name = "encoder"
-            executor = "encoder"
+            strategy = "encoder"
             model_format = "onnx"
             transport = "grpc"
             request_shape = "score_tasks"
@@ -528,7 +528,7 @@ mod tests {
             fallback_label = "needs_llm"
             [[tier]]
             name = "rules"
-            executor = "rules"
+            strategy = "rules"
             transport = "in_process"
         "#);
         assert!(result.is_err_and(|e| e.to_string().contains("task.route.cascade is required")));
@@ -563,11 +563,11 @@ mod tests {
             fallback_label = "needs_llm"
             [[tier]]
             name = "rules"
-            executor = "rules"
+            strategy = "rules"
             transport = "in_process"
             [[tier]]
             name = "fasttext"
-            executor = "fasttext"
+            strategy = "fasttext"
             transport = "in_process"
             [tier_policy.fasttext.route]
             min_confidence = 0.9

@@ -44,7 +44,7 @@ The engine is a **six-tier deterministic fallback cascade**. Each tier either re
 - **Early exit.** A request leaves the cascade at the first tier whose confidence meets its configured threshold.
 - **No GC pauses, minimal allocation.** The hot path is native Rust with C++ bindings, a replaced global allocator, and zero-copy ingress for the cheapest tiers.
 - **Deterministic behavior.** Given the same input, model artifacts, and configuration, the router returns the same decision.
-- **One encoder stage.** ModernBERT and Harrier are concrete model choices behind the encoder executor, not separate cascade tiers. A task path contains one encoder tier, whose declaration selects the model.
+- **One encoder stage.** ModernBERT and Harrier are concrete model choices behind the encoder strategy, not separate cascade tiers. A task path contains one encoder tier, whose declaration selects the model.
 
 ---
 
@@ -88,7 +88,7 @@ A new task adds its output contract, ordered `cascade` of TierNames, and policie
 
 The identity layers stay distinct. `TierName` identifies an authored tier definition and appears in task cascades. `TierId` is generated only when `CascadeGraph` materializes a concrete instance; the hash includes its name and behavior-determining configuration, including inference runtime, model-related configuration and loaded artifact content. Endpoint and timeout are deployment details, not identity. `Slot` is the instance's position in the compiled graph, an execution/telemetry address rather than an identity.
 
-`model` in the named tier declaration identifies the concrete model; `model_format` identifies its inference format. `Tier` remains an abstract executor/transport/request-shape descriptor. `TierInstance` resolves the declaration and passes the model identifier to the executor. The encoder request formatter carries that identifier through gRPC metadata, and the sidecar rejects a request when its loaded model does not match. `TierInstance` is owned by `CascadeGraph`, not by `TierRegistry`.
+`model` in the named tier declaration identifies the concrete model; `model_format` identifies its inference format. `Tier` remains an abstract strategy/transport/request-shape descriptor. `TierInstance` resolves the declaration and passes the model identifier to the selected runner. The encoder request formatter carries that identifier through gRPC metadata, and the sidecar rejects a request when its loaded model does not match. `TierInstance` is owned by `CascadeGraph`, not by `TierRegistry`.
 
 The original four tiers were once numbered 1 to 4, and those numbers survive at the edges: numbered telemetry fields, `[router.tierN]` settings, numbered environment variables and `tierN` aliases in `[tier_policy.*]` keys. The `[legacy_tiers]` table in `tasks.toml` is the only place a name and a number meet. It is read at load and handed to code that writes those compatibility surfaces; no tier, instance, registry or Cascade carries a number. Configuration with no explicit `[[tier]]` entries defaults to rules (1), fastText (2), and one encoder stage (3); historical tier-4 telemetry remains a compatibility field.
 
@@ -116,10 +116,10 @@ The original four tiers were once numbered 1 to 4, and those numbers survive at 
 - **Robust** to typos, inflections, and fuzzy keyword variation, because subword features generalize across spellings.
 - **Artifact:** quantized binary `router_fastpath.ftz`.
 
-### Tier 3: Encoder Executor
+### Tier 3: Encoder Strategy
 
-- **One execution stage:** The encoder executor fronts one selected model for a given tier instance. ModernBERT and Harrier are model implementations, not separate cascade stages.
-- **Model selection:** The tier declaration names the concrete model and its format. The instance passes that selection through the executor and gRPC transport to the sidecar, which validates that the request targets the model it loaded.
+- **One execution stage:** The encoder strategy selects the model-backed evaluation path for a given tier instance. ModernBERT and Harrier are model implementations, not separate cascade stages.
+- **Model selection:** The tier declaration names the concrete model and its format. The instance passes that selection through the selected runner and gRPC transport to the sidecar, which validates that the request targets the model it loaded.
 - **Joint inference:** With `request_shape = "score_tasks"`, the sidecar encodes the prompt once and evaluates each requested task head against the shared representation. Route and tag therefore share one encoder invocation when both tasks are ready in the same cohort.
 - **Alternative model:** Harrier can replace ModernBERT by changing the encoder tier's `model`, `model_format`, and endpoint configuration. It does not appear as another element in the task Cascade.
 

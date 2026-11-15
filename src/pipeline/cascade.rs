@@ -428,7 +428,7 @@ mod tests {
     use super::*;
     use crate::pipeline::task::{FallbackPolicy, OutputKind};
     use crate::pipeline::tier::{
-        tname, FakeEvaluate, ModelFormat, Params, RequestShape, Role, TierContext, TierOutput,
+        tname, FakeEvaluate, ModelFormat, Params, RequestShape, Strategy, TierContext, TierOutput,
         Transport,
     };
     use async_trait::async_trait;
@@ -448,7 +448,7 @@ mod tests {
             registry.register_fake(
                 tname(name),
                 super::super::tier::Tier {
-                    exex: Role::Encoder,
+                    strategy: Strategy::Encoder,
                     transport: Transport::Grpc,
                     request_shape: Some(RequestShape::Score),
                 },

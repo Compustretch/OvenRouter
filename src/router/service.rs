@@ -679,7 +679,7 @@ mod tests {
     use crate::pipeline::registry::TierRegistry;
     use crate::pipeline::runner::TaskOutcome;
     use crate::pipeline::task::{FallbackPolicy, OutputKind};
-    use crate::pipeline::tier::{FakeEvaluate, ModelFormat, Params, RequestShape, Role, Tier, TierContext, TierOutput, Transport};
+    use crate::pipeline::tier::{FakeEvaluate, ModelFormat, Params, RequestShape, Strategy, Tier, TierContext, TierOutput, Transport};
     use async_trait::async_trait;
 
     struct NamedTier;
@@ -695,13 +695,13 @@ mod tests {
         for name in ["rules", "prefilter", "modernbert"] {
             let (tier, params) = if name == "rules" {
                 (
-                    Tier { exex: Role::Rules, transport: Transport::InProcess, request_shape: None },
+                    Tier { strategy: Strategy::Rules, transport: Transport::InProcess, request_shape: None },
                     Params { model_format: None, model: None, config: Some("test-rules".into()),
                         endpoint: None, timeout_ms: None, enabled: None },
                 )
             } else {
                 (
-                    Tier { exex: Role::Encoder, transport: Transport::Grpc, request_shape: Some(RequestShape::Score) },
+                    Tier { strategy: Strategy::Encoder, transport: Transport::Grpc, request_shape: Some(RequestShape::Score) },
                     Params { model_format: Some(ModelFormat::Onnx), model: Some(name.into()), config: None,
                         endpoint: Some("http://127.0.0.1:9".into()), timeout_ms: Some(250), enabled: None },
                 )

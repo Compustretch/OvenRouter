@@ -348,7 +348,7 @@ mod tests {
     use crate::pipeline::cascade::{Cascade, CascadeGraph, Slot};
     use crate::pipeline::registry::TierRegistry;
     use crate::pipeline::task::{FallbackPolicy, OutputKind, TierPolicy, LABEL_JEV, LABEL_LLM};
-    use crate::pipeline::tier::{tname, FakeEvaluate, ModelFormat, Params, RequestShape, Role, Tier, TierContext, TierOutput, Transport};
+    use crate::pipeline::tier::{tname, FakeEvaluate, ModelFormat, Params, RequestShape, Strategy, Tier, TierContext, TierOutput, Transport};
     use async_trait::async_trait;
     use std::collections::BTreeMap;
     use std::sync::Mutex;
@@ -378,7 +378,7 @@ mod tests {
         answers: &[(&str, TierReading)]) -> (super::super::tier::TierName, Tier, Params, Arc<dyn FakeEvaluate>) {
         (
             tname(name),
-            Tier { exex: Role::Encoder, transport: Transport::Grpc, request_shape: Some(RequestShape::Score) },
+            Tier { strategy: Strategy::Encoder, transport: Transport::Grpc, request_shape: Some(RequestShape::Score) },
             Params {
                 model_format: Some(ModelFormat::Onnx), model: Some(name.into()), config: None,
                 endpoint: Some("http://127.0.0.1:9".into()), timeout_ms: Some(250), enabled: None,
