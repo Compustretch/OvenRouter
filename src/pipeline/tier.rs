@@ -121,6 +121,10 @@ pub enum Strategy {
     FastText,
     #[serde(rename = "encoder", alias = "scorer")]
     Encoder,
+    #[serde(rename = "decision")]
+    Decision,
+    #[serde(rename = "generative")]
+    Generative,
 }
 
 impl Strategy {
@@ -129,7 +133,19 @@ impl Strategy {
             Self::Rules => "rules",
             Self::FastText => "fasttext",
             Self::Encoder => "encoder",
+            Self::Decision => "decision",
+            Self::Generative => "generative",
         }
+    }
+
+    /// Only rules, fasttext and encoder are executable nodes in CascadeGraph.
+    pub const fn is_cascade_strategy(self) -> bool {
+        matches!(self, Self::Rules | Self::FastText | Self::Encoder)
+    }
+
+    /// Decision and generative execute after route classification, outside the DAG.
+    pub const fn is_terminal(self) -> bool {
+        matches!(self, Self::Decision | Self::Generative)
     }
 }
 
@@ -175,6 +191,16 @@ pub struct Tier {
 impl Tier {
     /// A definition is coherent when its strategy, transport and request shape agree.
     pub fn validate(&self) -> Result<(), &'static str> {
+        match (self.strategy.is_cascade_strategy(), self.strategy.is_terminal()) {
+            (true, false) => {}
+            (false, true) => {
+                return Err("decision and generative are terminal execution strategies, not cascade tiers");
+            }
+            _ => {
+                return Err("every strategy must belong to exactly one of the cascade or terminal sets");
+            }
+        }
+
         match (self.strategy, self.transport, self.request_shape) {
             (Strategy::Rules | Strategy::FastText, Transport::InProcess, None) => Ok(()),
             (Strategy::Rules | Strategy::FastText, _, _) => {
@@ -183,6 +209,9 @@ impl Tier {
             (Strategy::Encoder, Transport::Grpc, Some(_)) => Ok(()),
             (Strategy::Encoder, _, _) => {
                 Err("encoder requires transport = \"grpc\" and request_shape = \"score\" or \"score_tasks\"")
+            }
+            (Strategy::Decision | Strategy::Generative, _, _) => {
+                Err("decision and generative are terminal execution strategies, not cascade tiers")
             }
         }
     }
@@ -402,6 +431,9 @@ impl TierInstance {
                     model,
                     Duration::from_millis(timeout_ms),
                 )?), None)
+            }
+            Strategy::Decision | Strategy::Generative => {
+                return Err(format!("tier {name}: terminal strategy {} cannot be materialized in CascadeGraph", tier.strategy.as_str()).into());
             }
         };
         Ok(Self::assemble(name, tier, params, runner, artifact_hash))
@@ -663,6 +695,21 @@ mod tests {
     };
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tonic::{Request, Response, Status};
+
+    #[test]
+    fn strategy_ontology_has_exactly_five_canonical_values() {
+        let values = [
+            Strategy::Rules,
+            Strategy::FastText,
+            Strategy::Encoder,
+            Strategy::Decision,
+            Strategy::Generative,
+        ];
+        let names: Vec<_> = values.iter().map(|strategy| strategy.as_str()).collect();
+        assert_eq!(names, ["rules", "fasttext", "encoder", "decision", "generative"]);
+        assert_eq!(values.iter().filter(|strategy| strategy.is_cascade_strategy()).count(), 3);
+        assert_eq!(values.iter().filter(|strategy| strategy.is_terminal()).count(), 2);
+    }
 
     #[test]
     fn tier_id_round_trips_through_hex() {

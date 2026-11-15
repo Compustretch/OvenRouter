@@ -127,6 +127,9 @@ fn resolve_instance_params(
             resolved.endpoint = Some(endpoint);
             resolved.timeout_ms = Some(u64::try_from(timeout.as_millis())?);
         }
+        Strategy::Decision | Strategy::Generative => {
+            return Err(format!("terminal strategy {} cannot be registered as a cascade tier", tier.strategy.as_str()).into());
+        }
     }
     Ok(resolved)
 }
@@ -302,14 +305,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         tier2_enabled = config.router.tier2.enabled,
         tier3_enabled = config.router.tier3.enabled,
         tier4_enabled = config.router.tier4.enabled,
-        tier5_enabled = config.router.tier5.enabled,
-        tier6_enabled = config.router.tier6.enabled,
-        "configured tier status"
+        decision_enabled = config.router.decision.enabled,
+        generative_enabled = config.router.generative.enabled,
+        "configured strategy status"
     );
     tracing::debug!(verbose, "startup verbosity configured");
 
     let pipeline_config =
         pipeline::config::load_or_default(env_or("TASKS_CONFIG", "config/tasks.toml"))?;
+    if !pipeline_config.has_policy("route") {
+        return Err("tasks.toml: route task has no configured tier policy".into());
+    }
     // ---- Build the complete available-tier registry -----------------------
     // [[tier]] supplies definitions; its array order has no execution meaning.
     let mut registry = TierRegistry::new();
@@ -343,7 +349,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     for (name, by_task) in &pipeline_config.tier_policies {
         if let Some(id) = execution_graph.id_for_name(name) {
             let eligible: std::collections::BTreeMap<_, _> = by_task.iter()
-                .filter(|(task, _)| execution_graph.task_uses(task, &id))
+                .filter(|(task, _)| execution_graph.tasks_using(&id)
+                    .is_some_and(|users| users.contains(*task)))
                 .map(|(task, policy)| (task.clone(), policy.clone()))
                 .collect();
             if !eligible.is_empty() {
@@ -356,10 +363,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if execution_graph.order().is_empty() {
         return Err("no enabled task cascade contains an available tier".into());
     }
+    let task_path_transitions = execution_graph.dependencies()
+        .map(|edge| (
+            execution_graph.tier_name(&edge.from).map(ToString::to_string),
+            execution_graph.tier_name(&edge.to).map(ToString::to_string),
+            edge.tasks.into_iter().collect::<Vec<_>>(),
+        ))
+        .collect::<Vec<_>>();
     tracing::info!(
         order = ?execution_graph.order().iter()
             .filter_map(|id| execution_graph.tier_name(id).map(ToString::to_string))
             .collect::<Vec<_>>(),
+        task_path_transitions = ?task_path_transitions,
         "compiled task cascade graph"
     );
 
@@ -426,21 +441,46 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cascade = Arc::new(CascadeRunner::new(execution_graph));
     let legacy = Arc::new(pipeline_config.legacy.clone());
 
-    let downstream_timeout =
-        Duration::from_millis(env_or("DOWNSTREAM_TIMEOUT_MS", "120000").parse()?);
-    let dispatcher = DownstreamDispatcher::new_with_enabled(
-        env_or(
-            "TIER5_ENDPOINT",
-            &env_or("TIER4_ENDPOINT", "http://127.0.0.1:11435/api/decide"),
+    let default_execution_timeout_ms: u64 =
+        env_or("DOWNSTREAM_TIMEOUT_MS", "120000").parse()?;
+    let decision_endpoint = env_or(
+        "DECISION_ENDPOINT",
+        config.router.decision.endpoint.as_deref().unwrap_or("http://127.0.0.1:11435/api/decide"),
+    );
+    let decision_model = env_or(
+        "DECISION_MODEL",
+        config.router.decision.model.as_deref().unwrap_or("laya:en"),
+    );
+    let generative_endpoint = env_or(
+        "GENERATIVE_ENDPOINT",
+        &env_or(
+            "OLLAMA_GENERATE_URL",
+            config.router.generative.endpoint.as_deref().unwrap_or("http://127.0.0.1:11434/api/generate"),
         ),
-        env_or("OLLAMA_GENERATE_URL", "http://127.0.0.1:11434/api/generate"),
-        env_or("GEMMA_MODEL", "gemma3:latest"),
-        downstream_timeout,
+    );
+    let generative_model = env_or(
+        "GENERATIVE_MODEL",
+        &env_or("GEMMA_MODEL", config.router.generative.model.as_deref().unwrap_or("gemma3:latest")),
+    );
+    let decision_timeout = Duration::from_millis(
+        config.router.decision.timeout_ms.unwrap_or(default_execution_timeout_ms),
+    );
+    let generative_timeout = Duration::from_millis(
+        config.router.generative.timeout_ms.unwrap_or(default_execution_timeout_ms),
+    );
+    let downstream_timeout = decision_timeout.max(generative_timeout);
+    let dispatcher = DownstreamDispatcher::new_with_enabled(
+        decision_endpoint,
+        decision_model,
+        generative_endpoint,
+        generative_model,
+        decision_timeout,
+        generative_timeout,
         3,
         Duration::from_secs(30),
         Duration::from_secs(30),
-        config.router.tier5.enabled,
-        config.router.tier6.enabled,
+        config.router.decision.enabled,
+        config.router.generative.enabled,
     )?;
 
     let clickhouse_url = env_or("CLICKHOUSE_URL", "http://127.0.0.1:8123");
@@ -500,10 +540,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Ok::<(), std::io::Error>(())
     });
 
-    let ollama_tagger = OvenV1Tagger::new(
-        env_or("TAGGER_OLLAMA_URL", "http://127.0.0.1:11434"),
-        env_or("TAGGER_MODEL", "qwen3:1.7b"),
-    );
+    let tagger_url = env_or("TAGGER_OLLAMA_URL", "http://127.0.0.1:11434");
+    let tagger_model = env_or("TAGGER_MODEL", "qwen3:1.7b");
+    let ollama_tagger = match runtime_tasks.iter().find(|task| task.name == "tag") {
+        Some(task) if task.labels.as_ref().is_some_and(|labels| !labels.is_empty()) =>
+            OvenV1Tagger::for_task(tagger_url, tagger_model, task).map_err(std::io::Error::other)?,
+        _ => OvenV1Tagger::new(tagger_url, tagger_model),
+    };
     let tag_sample_prob: f32 = env_or("TAG_SAMPLE_PROB", "1.0").parse()?;
     if !tag_sample_prob.is_finite() || !(0.0..=1.0).contains(&tag_sample_prob) {
         return Err("TAG_SAMPLE_PROB must be between 0 and 1".into());

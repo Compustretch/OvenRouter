@@ -383,10 +383,12 @@ impl CascadeGraph {
     /// All task-path precedence edges, with the tasks that contributed each edge.
     /// The iterator is derived from the canonical provenance map.
     pub fn dependencies(&self) -> impl Iterator<Item = CascadeDependency> + '_ {
-        self.progression_edges.iter().map(|((from, to), tasks)| CascadeDependency {
-            from: *from,
-            to: *to,
-            tasks: tasks.clone(),
+        self.progression_edges.keys().filter_map(move |(from, to)| {
+            self.tasks_on_transition(from, to).map(|tasks| CascadeDependency {
+                from: *from,
+                to: *to,
+                tasks: tasks.clone(),
+            })
         })
     }
 
@@ -410,9 +412,6 @@ impl CascadeGraph {
         self.instances.get(id).cloned()
     }
 
-    pub fn instance_for_name(&self, name: &TierName) -> Option<Arc<TierInstance>> {
-        self.id_for_name(name).and_then(|id| self.instance(&id))
-    }
 
     pub fn instances(&self) -> impl Iterator<Item = (&TierId, &Arc<TierInstance>)> {
         self.instances.iter()
@@ -492,7 +491,6 @@ mod tests {
         assert_eq!(graph.tasks_using(&encoder).unwrap().len(), 2);
         assert!(registry.get(&tname("unused")).is_some());
         assert!(graph.id_for_name(&tname("unused")).is_none());
-        assert!(graph.instance_for_name(&tname("unused")).is_none());
     }
 
     #[test]

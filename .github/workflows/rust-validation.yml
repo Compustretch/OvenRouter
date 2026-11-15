@@ -1,4 +1,4 @@
-name: Rust validation
+name: Rust and ClickHouse validation
 
 on:
   pull_request:
@@ -9,7 +9,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: rust-validation-${{ github.ref }}
+  group: validation-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
@@ -23,7 +23,50 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y build-essential clang cmake pkg-config protobuf-compiler
       - uses: Swatinem/rust-cache@v2
+      - name: Validate smoke-script syntax
+        run: |
+          for script in scripts/smoke-jev-ch.sh tests/e2e/it-support-live.sh tests/clickhouse/migration-smoke.sh; do
+            bash -n "$script"
+          done
+
+      - name: Check production binary without test configuration
+        env:
+          RUSTFLAGS: -D warnings
+        run: cargo check --bin cascade-router
       - name: Run Rust tests
         env:
           RUSTFLAGS: -D warnings
         run: cargo test --all-targets
+
+  clickhouse-migrations:
+    runs-on: ubuntu-latest
+    services:
+      clickhouse:
+        image: clickhouse/clickhouse-server:25.3
+        env:
+          CLICKHOUSE_USER: ci_smoke
+          CLICKHOUSE_PASSWORD: ci_smoke
+          CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: 1
+        ports:
+          - 8123:8123
+    steps:
+      - uses: actions/checkout@v4
+      - name: Wait for ClickHouse
+        env:
+          CLICKHOUSE_USER: ci_smoke
+          CLICKHOUSE_PASSWORD: ci_smoke
+        run: |
+          for attempt in $(seq 1 60); do
+            if curl --silent --fail --user "$CLICKHOUSE_USER:$CLICKHOUSE_PASSWORD" http://127.0.0.1:8123/ping; then
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "ClickHouse did not become ready" >&2
+          exit 1
+      - name: Run clean-install and historical migration smoke
+        env:
+          CLICKHOUSE_URL: http://127.0.0.1:8123
+          CLICKHOUSE_USER: ci_smoke
+          CLICKHOUSE_PASSWORD: ci_smoke
+        run: bash tests/clickhouse/migration-smoke.sh

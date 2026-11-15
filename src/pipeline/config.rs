@@ -118,6 +118,9 @@ fn tier_configs_from(raw: Vec<RawTier>) -> Result<Vec<TierConfig>, Box<dyn Error
             Strategy::FastText | Strategy::Encoder if tier.config.is_some() => {
                 return Err(format!("[[tier]] {label:?}: `config` is only valid on a rules tier").into());
             }
+            Strategy::Decision | Strategy::Generative => {
+                return Err(format!("[[tier]] {label:?}: {} is a terminal execution strategy and cannot be declared in the cascade registry", definition.strategy.as_str()).into());
+            }
             _ => {}
         }
         for (field, value) in [("endpoint", &tier.endpoint), ("model", &tier.model), ("config", &tier.config)] {

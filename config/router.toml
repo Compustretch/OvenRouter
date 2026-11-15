@@ -14,8 +14,14 @@ enabled = true
 endpoint = "http://[::1]:50051"
 timeout_ms = 500
 
-[router.tier5]
+[router.decision]
 enabled = true
+endpoint = "http://127.0.0.1:11435/api/decide"
+model = "laya:en"
+timeout_ms = 120000
 
-[router.tier6]
+[router.generative]
 enabled = true
+endpoint = "http://127.0.0.1:11434/api/generate"
+model = "gemma3:latest"
+timeout_ms = 120000

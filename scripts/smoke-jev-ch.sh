@@ -1,12 +1,8 @@
 #!/usr/bin/env bash
 #
-# scripts/smoke-jev-ch.sh
-#
-# Smoke test: embed a unique key in the prompt, POST it to the router, then find
-# the router's route_decisions row by searching prompt_raw for that key, and
-# follow its router-generated request_id into task_tags.
-#
-# Requirements: bash, curl, jq
+# Arithmetic smoke test for router ingress, request correlation and ClickHouse.
+# The prompt/state/questions remain semantically clean. Correlation is carried
+# only by X-Request-ID, and all primary assertions use typed ClickHouse tables.
 
 set -Eeuo pipefail
 
@@ -16,200 +12,159 @@ PROJECT_ROOT="$(cd -- "${SCRIPT_DIR}/.." && pwd)"
 ROUTER_URL="${ROUTER_URL:-http://127.0.0.1:8080/v1/decisions}"
 CLICKHOUSE_URL="${CLICKHOUSE_URL:-http://127.0.0.1:8123}"
 CLICKHOUSE_DATABASE="${CLICKHOUSE_DATABASE:-llm_observability}"
-ROUTE_TABLE="${CLICKHOUSE_DATABASE}.route_decisions"
-TAG_TABLE="${CLICKHOUSE_DATABASE}.task_tags"
-
 ROUTE_WAIT_SECONDS="${ROUTE_WAIT_SECONDS:-60}"
 TAG_WAIT_SECONDS="${TAG_WAIT_SECONDS:-45}"
 ROUTER_TIMEOUT_SECONDS="${ROUTER_TIMEOUT_SECONDS:-60}"
 
-# Unique key: only [a-z0-9-], so it is safe to embed in SQL and JSON.
-if command -v uuidgen >/dev/null 2>&1; then
-    SMOKE_KEY="smoke-$(uuidgen | tr '[:upper:]' '[:lower:]')"
-else
-    SMOKE_KEY="smoke-$(date +%s)-${RANDOM}${RANDOM}"
-fi
-
-# Key is appended so the leading text the router classifies stays unchanged.
-PROMPT="What is 18% of 450? [${SMOKE_KEY}]"
+for cmd in curl jq uuidgen awk; do
+    command -v "$cmd" >/dev/null 2>&1 || { echo "$cmd is required" >&2; exit 1; }
+done
 
 AUTH_FILE="${PROJECT_ROOT}/.auth"
 RESPONSE_FILE="$(mktemp)"
-CH_CURL_ARGS=()
-
-cleanup() { rm -f "$RESPONSE_FILE"; }
+HEADER_FILE="$(mktemp)"
+cleanup() { rm -f "$RESPONSE_FILE" "$HEADER_FILE"; }
 trap cleanup EXIT
 
-fail()    { printf '[FAIL] %s\n' "$*" >&2; exit 1; }
-info()    { printf '[INFO] %s\n' "$*"; }
-pass()    { printf '[PASS] %s\n' "$*"; }
-section() { printf '\n================================================================\n  %s\n================================================================\n' "$1"; }
+fail() { printf '[FAIL] %s\n' "$*" >&2; exit 1; }
+info() { printf '[INFO] %s\n' "$*"; }
+pass() { printf '[PASS] %s\n' "$*"; }
+section() { printf '\n============================================================\n  %s\n============================================================\n' "$1"; }
 
-# ---------------------------------------------------------------------------
-# Setup
-# ---------------------------------------------------------------------------
-section "SETUP"
-
-for cmd in curl jq; do
-    command -v "$cmd" >/dev/null 2>&1 || fail "Required command not found: $cmd"
-done
-
-[[ -f "$AUTH_FILE" ]] || fail "Missing credentials file: ${AUTH_FILE}"
+[[ -f "$AUTH_FILE" ]] || fail "Missing credentials file: $AUTH_FILE"
 set -a
 # shellcheck disable=SC1090
 source "$AUTH_FILE"
 set +a
 : "${CLICKHOUSE_USER:?CLICKHOUSE_USER missing from .auth}"
 : "${CLICKHOUSE_PASSWORD:?CLICKHOUSE_PASSWORD missing from .auth}"
-CH_CURL_ARGS=(--user "${CLICKHOUSE_USER}:${CLICKHOUSE_PASSWORD}")
-
-# On a ClickHouse error, the error text is returned and the exit status is non-zero.
 ch_query() {
-    curl -sS --fail-with-body "${CH_CURL_ARGS[@]}" \
+    curl -sS --fail-with-body --user "${CLICKHOUSE_USER}:${CLICKHOUSE_PASSWORD}" \
         --get --data-urlencode "query=$1" "${CLICKHOUSE_URL}/"
 }
 
-info "Router:      ${ROUTER_URL}"
-info "ClickHouse:  ${CLICKHOUSE_URL} (${CLICKHOUSE_DATABASE})"
-info "Unique key:  ${SMOKE_KEY}"
+# The UUID is generated independently and never appears in request semantics.
+SMOKE_UUID="$(uuidgen | tr '[:upper:]' '[:lower:]')"
+[[ "$SMOKE_UUID" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$ ]] \
+    || fail "uuidgen did not produce a canonical UUIDv4: $SMOKE_UUID"
 
-ch_query "SELECT 1 FORMAT TabSeparated" >/dev/null || fail "ClickHouse unreachable or auth failed"
-for t in route_decisions task_tags; do
-    n="$(ch_query "SELECT count() FROM system.tables WHERE database='${CLICKHOUSE_DATABASE}' AND name='${t}' FORMAT TabSeparated")" \
-        || fail "Could not inspect table ${t}"
-    [[ "${n//[[:space:]]/}" == "1" ]] || fail "Table missing: ${CLICKHOUSE_DATABASE}.${t}"
+REQUEST_BODY='{
+  "prompt": "What is 18% of 450?",
+  "state": "What is 18% of 450?",
+  "questions": {
+    "answer": {
+      "type": "choice",
+      "instructions": "What is 18 percent of 450? Select the exact result.",
+      "criteria": {
+        "81": "The exact arithmetic result is 81.",
+        "other": "The arithmetic result is any value other than 81."
+      }
+    }
+  }
+}'
+
+section "PREFLIGHT"
+ch_query "SELECT 1 FORMAT TabSeparated" >/dev/null || fail "ClickHouse unreachable or authentication failed"
+for table in route_decisions task_tags route_execution_results; do
+    count="$(ch_query "SELECT count() FROM system.tables WHERE database='${CLICKHOUSE_DATABASE}' AND name='${table}' FORMAT TabSeparated")" \
+        || fail "Could not inspect ClickHouse table $table"
+    [[ "${count//[[:space:]]/}" == "1" ]] || fail "Required typed table missing: ${CLICKHOUSE_DATABASE}.${table}"
 done
-pass "ClickHouse reachable; route_decisions and task_tags exist"
+curl -sS --fail-with-body --connect-timeout 3 --max-time 5 "${ROUTER_URL%/v1/decisions}/healthz" >/dev/null \
+    || fail "Router health check failed"
+pass "Router and typed ClickHouse projections are reachable"
+info "Request ID: $SMOKE_UUID"
 
-# ---------------------------------------------------------------------------
-# Request
-# ---------------------------------------------------------------------------
 section "ROUTER REQUEST"
-
-# NOTE: this body is the one part not verified against the router's handler.
-REQUEST_BODY="$(jq -cn --arg prompt "$PROMPT" '{prompt: $prompt}')"
-
-printf 'Exact prompt sent to router:\n  %s\n\nExact request body:\n' "$PROMPT"
-printf '%s\n' "$REQUEST_BODY" | jq .
-
-HTTP_STATUS="$(curl -sS --max-time "$ROUTER_TIMEOUT_SECONDS" \
-    --output "$RESPONSE_FILE" --write-out '%{http_code}' \
-    --request POST --header 'Content-Type: application/json' \
+HTTP_STATUS="$(curl -sS --connect-timeout 3 --max-time "$ROUTER_TIMEOUT_SECONDS" \
+    --dump-header "$HEADER_FILE" --output "$RESPONSE_FILE" --write-out '%{http_code}' \
+    --request POST \
+    --header 'Content-Type: application/json' \
+    --header "X-Request-ID: ${SMOKE_UUID}" \
     --data-binary "$REQUEST_BODY" "$ROUTER_URL")" || fail "Router HTTP request failed"
+[[ "$HTTP_STATUS" == "200" ]] || fail "Router returned HTTP $HTTP_STATUS: $(cat "$RESPONSE_FILE")"
 
-if [[ "$HTTP_STATUS" =~ ^2[0-9][0-9]$ ]]; then
-    pass "Router HTTP ${HTTP_STATUS}"
-else
-    printf '[WARN] Router HTTP %s (continuing: failures must still be logged)\n' "$HTTP_STATUS"
-fi
-printf '\nRouter response:\n'
-jq . "$RESPONSE_FILE" 2>/dev/null || cat "$RESPONSE_FILE"
+RESPONSE_REQUEST_ID="$(awk 'tolower($1) == "x-request-id:" { gsub("\r", "", $2); value=$2 } END { print value }' "$HEADER_FILE")"
+[[ "$RESPONSE_REQUEST_ID" == "$SMOKE_UUID" ]] \
+    || fail "Response X-Request-ID mismatch: expected $SMOKE_UUID, received ${RESPONSE_REQUEST_ID:-missing}"
+pass "Router response echoed X-Request-ID unchanged"
+info "Response body:"
+jq . "$RESPONSE_FILE" || cat "$RESPONSE_FILE"
 
-# ---------------------------------------------------------------------------
-# route_decisions: find by unique key in prompt_raw
-# ---------------------------------------------------------------------------
-section "ROUTE DECISION"
+assert_one_typed_row() {
+    local table="$1"
+    local count
+    count="$(ch_query "SELECT count() FROM ${CLICKHOUSE_DATABASE}.${table} FINAL WHERE request_id = toUUID('${SMOKE_UUID}') FORMAT TabSeparated")" \
+        || fail "Could not count typed rows for ${table}"
+    [[ "${count//[[:space:]]/}" == "1" ]] \
+        || fail "Expected exactly one ${table} row for request_id=${SMOKE_UUID}; found ${count}"
+    printf '[PASS] %s has exactly one row for request_id=%s\n' "$table" "$SMOKE_UUID"
+}
 
+wait_typed_row() {
+    local table="$1" request_id="$2" wait_seconds="$3" query="$4" result="" attempt
+    for ((attempt=1; attempt<=wait_seconds; attempt++)); do
+        result="$(ch_query "$query")" || fail "ClickHouse query failed for ${table} request_id=${request_id}"
+        [[ -n "$result" ]] && { printf '%s' "$result"; return 0; }
+        sleep 1
+    done
+    fail "No typed ${table} row for request_id=${request_id} within ${wait_seconds}s"
+}
+
+section "TYPED ROUTE CORRELATION"
 ROUTE_SQL="
 SELECT toString(request_id) AS request_id, toString(timestamp) AS timestamp,
-       policy_version, prompt_raw,
-       tier1_confidence, tier1_decided, tier1_reason,
-       tier2_p_jev, tier2_p_llm, tier2_reason,
-       tier3_score, tier3_reason, tier4_score, tier4_reason,
-       decided_by_tier, decided_backend, final_backend,
-       downstream_tier, downstream_outcome,
-       router_classification_latency_us,
-       downstream_invocation_latency_ms,
-       request_latency_primary_ms, request_latency_failover_ms,
-       is_failover, failure_reason, total_latency_us, sample_prob,
-       tasks_json
-FROM ${ROUTE_TABLE}
-WHERE position(prompt_raw, '${SMOKE_KEY}') > 0
-ORDER BY timestamp DESC
+       prompt_raw, decided_by_tier, decided_backend, final_backend,
+       downstream_tier, downstream_outcome, is_failover, failure_reason,
+       total_latency_us
+FROM ${CLICKHOUSE_DATABASE}.route_decisions FINAL
+WHERE request_id = toUUID('${SMOKE_UUID}')
 LIMIT 1
 FORMAT JSONEachRow
 "
+ROUTE_ROW="$(wait_typed_row route_decisions "$SMOKE_UUID" "$ROUTE_WAIT_SECONDS" "$ROUTE_SQL")"
+assert_one_typed_row route_decisions
+jq -e --arg id "$SMOKE_UUID" '.request_id == $id and .prompt_raw == "What is 18% of 450?"' \
+    <<<"$ROUTE_ROW" >/dev/null || fail "Typed route row has a mismatched ID or contaminated prompt"
+pass "route_decisions contains the same UUID and the exact clean prompt"
+printf '%s\n' "$ROUTE_ROW" | jq .
 
-ROUTE_JSON=""
-printf '[INFO] Polling route_decisions for key (up to %ss) ' "$ROUTE_WAIT_SECONDS"
-for ((i = 1; i <= ROUTE_WAIT_SECONDS; i++)); do
-    ROUTE_JSON="$(ch_query "$ROUTE_SQL")" || { printf '\n'; fail "route_decisions query error: ${ROUTE_JSON}"; }
-    [[ -n "$ROUTE_JSON" ]] && break
-    printf '.'
-    sleep 1
-done
-printf '\n'
-[[ -n "$ROUTE_JSON" ]] || fail "No route_decisions row contains key ${SMOKE_KEY}"
-
-REQUEST_ID="$(jq -r '.request_id' <<<"$ROUTE_JSON")"
-pass "Route record found; router-generated request ID: ${REQUEST_ID}"
-
-jq -r '
-    "  Request ID:               \(.request_id)",
-    "  Timestamp:                \(.timestamp)",
-    "  Policy version:           \(.policy_version)",
-    "  Prompt (as recorded):     \(.prompt_raw)",
-    "  Decided by tier:          \(.decided_by_tier)",
-    "  Decided backend:          \(.decided_backend)",
-    "  Final backend:            \(.final_backend)",
-    "  Downstream tier:          \(.downstream_tier // "null")",
-    "  Downstream outcome:       \(.downstream_outcome // "null")",
-    "  Failover:                 \(.is_failover)",
-    "  Failure reason:           \(.failure_reason // "null")",
-    "  Tier 1:                   conf=\(.tier1_confidence) decided=\(.tier1_decided) reason=\(.tier1_reason)",
-    "  Tier 2:                   p_jev=\(.tier2_p_jev // "null") p_llm=\(.tier2_p_llm // "null") reason=\(.tier2_reason // "null")",
-    "  Tier 3:                   score=\(.tier3_score // "null") reason=\(.tier3_reason // "null")",
-    "  Tier 4:                   score=\(.tier4_score // "null") reason=\(.tier4_reason // "null")",
-    "  Classification latency:   \(.router_classification_latency_us) us",
-    "  Downstream latency:       \(.downstream_invocation_latency_ms) ms",
-    "  Primary latency:          \(.request_latency_primary_ms // "null") ms",
-    "  Failover latency:         \(.request_latency_failover_ms // "null") ms",
-    "  Total latency:            \(.total_latency_us) us",
-    "  Sample probability:       \(.sample_prob)"
-' <<<"$ROUTE_JSON"
-
-# ---------------------------------------------------------------------------
-# task_tags: query the task decision provenance columns explicitly
-# ---------------------------------------------------------------------------
-section "TASK TAGGING"
-
-TAG_SQL="
-SELECT
-    toString(request_id) AS request_id,
-    task_id,
-    output_kind,
-    resolving_tier,
-    decision_model_id,
-    decision_scores_json,
-    taxonomy_version,
-    tagger_model,
-    latency_ms,
-    queue_wait_ms,
-    tag_status,
-    primary_category,
-    primary_score
-FROM ${TAG_TABLE}
-WHERE request_id = toUUID('${REQUEST_ID}')
+section "TYPED EXECUTION CORRELATION"
+EXECUTION_SQL="
+SELECT toString(request_id) AS request_id, cascade_decision_tier,
+       decided_by_tier_name, dispatch_attempts_json, final_strategy,
+       final_provider, final_model_id, final_status, final_failure_reason
+FROM ${CLICKHOUSE_DATABASE}.route_execution_results FINAL
+WHERE request_id = toUUID('${SMOKE_UUID}')
 LIMIT 1
-FORMAT Vertical
+FORMAT JSONEachRow
 "
+EXECUTION_ROW="$(wait_typed_row route_execution_results "$SMOKE_UUID" "$ROUTE_WAIT_SECONDS" "$EXECUTION_SQL")"
+assert_one_typed_row route_execution_results
+jq -e --arg id "$SMOKE_UUID" '.request_id == $id and (.dispatch_attempts_json | fromjson | length >= 1)' \
+    <<<"$EXECUTION_ROW" >/dev/null || fail "Typed execution projection is not correlated"
+pass "route_execution_results contains the same UUID and terminal attempt history"
+printf '%s\n' "$EXECUTION_ROW" | jq .
 
-TAG_OUT=""
-printf '[INFO] Polling task_tags (up to %ss) ' "$TAG_WAIT_SECONDS"
-for ((i = 1; i <= TAG_WAIT_SECONDS; i++)); do
-    TAG_OUT="$(ch_query "$TAG_SQL")" || { printf '\n'; fail "task_tags query error: ${TAG_OUT}"; }
-    [[ -n "$TAG_OUT" ]] && break
-    printf '.'
-    sleep 1
-done
-printf '\n'
+section "TYPED TASK-TAG CORRELATION"
+TAG_SQL="
+SELECT toString(request_id) AS request_id, task_id, output_kind,
+       taxonomy_version, tagger_model, tagger_version, tag_status,
+       primary_category, primary_score
+FROM ${CLICKHOUSE_DATABASE}.task_tags FINAL
+WHERE request_id = toUUID('${SMOKE_UUID}')
+LIMIT 1
+FORMAT JSONEachRow
+"
+TAG_ROW="$(wait_typed_row task_tags "$SMOKE_UUID" "$TAG_WAIT_SECONDS" "$TAG_SQL")"
+assert_one_typed_row task_tags
+jq -e --arg id "$SMOKE_UUID" '.request_id == $id' <<<"$TAG_ROW" >/dev/null \
+    || fail "Typed task-tag projection has a mismatched request ID"
+pass "task_tags contains the same UUID"
+printf '%s\n' "$TAG_ROW" | jq .
 
-section "RESULT"
-if [[ -n "$TAG_OUT" ]]; then
-    pass "Task-tag record found"
-    printf '%s\n' "$TAG_OUT"
-    pass "Router request, route_decisions, and task_tags all correlated"
-else
-    printf '[WARN] route_decisions verified; no task_tags row for %s within %ss\n' "$REQUEST_ID" "$TAG_WAIT_SECONDS"
-    exit 2
-fi
+# Raw rows are diagnostics only. They are never the primary correlation join.
+RAW_ROUTE_COUNT="$(ch_query "SELECT count() FROM ${CLICKHOUSE_DATABASE}.route_records_raw WHERE JSONExtractString(line, 'request_id')='${SMOKE_UUID}' FORMAT TabSeparated")"
+RAW_TAG_COUNT="$(ch_query "SELECT count() FROM ${CLICKHOUSE_DATABASE}.task_tags_raw WHERE JSONExtractString(line, 'request_id')='${SMOKE_UUID}' FORMAT TabSeparated")"
+info "Raw diagnostic rows: route_records_raw=${RAW_ROUTE_COUNT}, task_tags_raw=${RAW_TAG_COUNT}"
+pass "Header-only request correlation verified across router response and all typed telemetry projections"

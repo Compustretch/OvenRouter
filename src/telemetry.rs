@@ -48,6 +48,12 @@ pub struct RouteRecord {
     /// Generated identity of the tier that decided the route; empty for fallback.
     #[serde(default)]
     pub decided_by_tier_id: String,
+    /// Ordered terminal dispatch attempts, from first attempted strategy onward.
+    #[serde(default)]
+    pub dispatch_attempts: Vec<DispatchAttemptRecord>,
+    /// Final result delivered to the caller, or the terminal failure when no result exists.
+    #[serde(default)]
+    pub final_result: Option<FinalResultRecord>,
     pub final_routing: FinalRouting,
     #[serde(default)]
     pub router_classification_latency_us: u128,
@@ -57,8 +63,11 @@ pub struct RouteRecord {
     pub request_latency_primary_ms: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub request_latency_failover_ms: Option<f64>,
+    /// Legacy flat projection of the terminal result. Prefer final_result.status.
     #[serde(default)]
     pub downstream_outcome: Option<String>,
+    /// Legacy flat projection containing the canonical strategy name, not tier5/tier6.
+    /// Prefer final_result.strategy.
     #[serde(default)]
     pub downstream_tier: Option<String>,
     #[serde(default)]
@@ -67,6 +76,33 @@ pub struct RouteRecord {
     pub failure_reason: Option<String>,
     #[serde(default)]
     pub sampling: Sampling,
+}
+
+/// One terminal execution attempt. Strategy, provider, and model are separate identities.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DispatchAttemptRecord {
+    pub strategy: String,
+    #[serde(default)]
+    pub provider: Option<String>,
+    #[serde(default)]
+    pub model_id: Option<String>,
+    pub outcome: String,
+    pub latency_ms: f64,
+    #[serde(default)]
+    pub failure_reason: Option<String>,
+}
+
+/// The terminal result returned to the caller, or the terminal failure.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FinalResultRecord {
+    pub strategy: String,
+    #[serde(default)]
+    pub provider: Option<String>,
+    #[serde(default)]
+    pub model_id: Option<String>,
+    pub status: String,
+    #[serde(default)]
+    pub failure_reason: Option<String>,
 }
 
 /// One tier's reading and decision for the route task.
@@ -156,12 +192,11 @@ pub type Tier4Outcome = Tier3Outcome;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FinalRouting {
+    /// Legacy provider projection. Canonical provider/model are in final_result.
     pub backend: String,
-    /// Legacy number. Before dispatch it is the deciding tier's ordinal; after
-    /// dispatch it is the downstream tier that served the request (5 jev, 6 llm).
+    /// Legacy cascade decision ordinal only. 6 means fallback, never a downstream strategy.
     pub tier: u8,
-    /// Name matching `tier`: the deciding tier's name before dispatch, then the
-    /// downstream backend that served the request (`jev` or `llm`).
+    /// Legacy authored cascade tier name (or "fallback"); not the terminal strategy.
     #[serde(default)]
     pub tier_name: String,
     pub latency_us: u128,

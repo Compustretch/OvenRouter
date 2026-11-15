@@ -4,32 +4,8 @@ use reqwest::Client;
 use serde_json::{json, Value};
 use tokio::time::timeout;
 
-#[derive(Debug)]
-pub enum DownstreamError {
-    Disabled,
-    CircuitOpen,
-    Timeout,
-    NotEligible,
-    Transport(String),
-    HttpStatus(u16, String),
-    InvalidResponse(String),
-}
+use super::downstream::DownstreamError;
 
-impl std::fmt::Display for DownstreamError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Disabled => write!(f, "downstream tier is disabled by configuration"),
-            Self::CircuitOpen => write!(f, "circuit breaker is open"),
-            Self::Timeout => write!(f, "downstream request timed out"),
-            Self::NotEligible => write!(f, "Laya determined Jev is not eligible"),
-            Self::Transport(error) => write!(f, "downstream transport error: {error}"),
-            Self::HttpStatus(status, body) => {
-                write!(f, "downstream returned HTTP {status}: {body}")
-            }
-            Self::InvalidResponse(error) => write!(f, "invalid downstream JSON response: {error}"),
-        }
-    }
-}
 
 pub struct CircuitBreaker {
     failure_threshold: usize,
@@ -103,16 +79,18 @@ impl CircuitBreaker {
     }
 }
 
-pub struct Tier5Runner {
+pub struct DecisionRunner {
     client: Client,
     endpoint: String,
+    model: String,
     timeout: Duration,
     breaker: CircuitBreaker,
 }
 
-impl Tier5Runner {
+impl DecisionRunner {
     pub fn new(
         endpoint: String,
+        model: String,
         timeout: Duration,
         failure_threshold: usize,
         failure_window: Duration,
@@ -121,6 +99,7 @@ impl Tier5Runner {
         Ok(Self {
             client: Client::builder().build()?,
             endpoint,
+            model,
             timeout,
             breaker: CircuitBreaker::new(failure_threshold, failure_window, breaker_open_duration),
         })
@@ -128,6 +107,7 @@ impl Tier5Runner {
 
     pub async fn invoke(
         &self,
+        request_id: &str,
         state: &Value,
         questions: &serde_json::Map<String, Value>,
     ) -> Result<(Value, Duration), DownstreamError> {
@@ -156,8 +136,9 @@ impl Tier5Runner {
             let response = self
                 .client
                 .post(&self.endpoint)
+                .header("X-Request-ID", request_id)
                 .json(&json!({
-                    "model": "laya",
+                    "model": &self.model,
                     "state": state,
                     "questions": questions,
                     "stream": false,

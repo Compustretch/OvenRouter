@@ -6,7 +6,7 @@
 
 An in-process, high-throughput request routing engine written in Rust. It classifies incoming prompts and routes them to discriminative (Jev) or generative (LLM) execution pathways with a **p99 decision latency under 5 ms** for the overwhelming majority of traffic.
 
-The engine is a **six-tier deterministic fallback cascade**. Each tier either resolves the request with sufficient confidence or passes it to the next, more expensive tier. Cheap tiers absorb most traffic, so the expensive tiers only see the ambiguous remainder.
+The router uses five canonical strategies: `rules`, `fasttext`, `encoder`, `decision`, and `generative`. The first three are cascade strategies compiled into the task-owned DAG. `decision` and `generative` are terminal execution strategies selected after route classification; they are never nodes in `CascadeGraph`.
 
 <table width="100%"><tr><td>
  <h3>Most LLM requests do not need a generative model.</h3>
@@ -57,7 +57,7 @@ Each tier returns one of two outcomes:
 - **Resolved:** the tier produced a routing decision whose confidence meets its threshold. The cascade terminates and the decision is returned.
 - **PassThrough:** the tier could not decide with enough confidence (or is disabled). The payload moves to the next tier.
 
-Tier 6 is the terminal generative tier. Provider availability determines whether a response can be returned.
+The cascade contains only the cascade strategies `rules`, `fasttext`, and `encoder`. Once route classification completes, the terminal dispatcher selects `decision` or `generative`. Strategy and provider are independent identities: `decision` currently executes through Ollaya, and `generative` currently executes through Ollama. The configured model identity (for example, `laya:en` or `gemma3:latest`) is recorded separately.
 
 The `TierRegistry` catalogs available `Tier` definitions and their declarative parameters by `TierName`; it stores no `TierInstance` and assigns no `TierId`. Each `Task` owns an ordered `Cascade` of `TierName` values. `CascadeGraph` compiles the paths into a global union of materialized tier instances, assigning each instance a hash-derived `TierId`. Shared names produce shared graph nodes; each union transition retains the task paths that contributed it. Unused definitions remain in the registry without acquiring an instance ID. A cycle in the union of task-path transitions fails validation. Disabled definitions are omitted from each task's Cascade while preserving the remaining relative order.
 
@@ -90,9 +90,9 @@ The identity layers stay distinct. `TierName` identifies an authored tier defini
 
 `model` in the named tier declaration identifies the concrete model; `model_format` identifies its inference format. `Tier` remains an abstract strategy/transport/request-shape descriptor. `TierInstance` resolves the declaration and passes the model identifier to the selected runner. The encoder request formatter carries that identifier through gRPC metadata, and the sidecar rejects a request when its loaded model does not match. `TierInstance` is owned by `CascadeGraph`, not by `TierRegistry`.
 
-The original four tiers were once numbered 1 to 4, and those numbers survive at the edges: numbered telemetry fields, `[router.tierN]` settings, numbered environment variables and `tierN` aliases in `[tier_policy.*]` keys. The `[legacy_tiers]` table in `tasks.toml` is the only place a name and a number meet. It is read at load and handed to code that writes those compatibility surfaces; no tier, instance, registry or Cascade carries a number. Configuration with no explicit `[[tier]]` entries defaults to rules (1), fastText (2), and one encoder stage (3); historical tier-4 telemetry remains a compatibility field.
+The original four cascade positions remain only at the compatibility boundary: numbered telemetry fields, `[router.tierN]` settings, numbered environment variables, and `tierN` aliases in `[tier_policy.*]`. The `[legacy_tiers]` table in `tasks.toml` is the only place a cascade name and one of those old ordinals meet. The terminal strategies `decision` and `generative` have no cascade ordinal and no `TierId`.
 
-`CascadeGraph` computes a deterministic topological projection of the global union of task-path transitions by resolving adjacent TierName pairs to hash-derived TierIds. That order supports stable graph presentation and `Slot` assignment; it is not a global runtime barrier. The runner advances each task along its own ordered path and concurrently evaluates independent ready nodes. Shared TierNames resolve to one shared `TierInstance`; tasks ready together at that node are batched, while later cohorts can invoke the same instance independently. Definitions absent from every task path remain available in the registry but do not materialize. The complete `tier_outcomes` array remains name-keyed in per-task progression order; existing numbered fields remain compatibility projections. Tiers 5 and 6 are downstream execution backends, not Cascade nodes.
+`CascadeGraph` computes a deterministic topological projection of the global union of task-path transitions by resolving adjacent TierName pairs to hash-derived TierIds. That order supports stable graph presentation and `Slot` assignment; it is not a global runtime barrier. The runner advances each task along its own ordered path and concurrently evaluates independent ready nodes. Shared TierNames resolve to one shared `TierInstance`; tasks ready together at that node are batched, while later cohorts can invoke the same instance independently. Definitions absent from every task path remain available in the registry but do not materialize. The complete `tier_outcomes` array remains name-keyed in per-task progression order; existing numbered fields remain compatibility projections. Neither `decision` nor `generative` is a Cascade node.
 
 ---
 
@@ -123,31 +123,34 @@ The original four tiers were once numbered 1 to 4, and those numbers survive at 
 - **Joint inference:** With `request_shape = "score_tasks"`, the sidecar encodes the prompt once and evaluates each requested task head against the shared representation. Route and tag therefore share one encoder invocation when both tasks are ready in the same cohort.
 - **Alternative model:** Harrier can replace ModernBERT by changing the encoder tier's `model`, `model_format`, and endpoint configuration. It does not appear as another element in the task Cascade.
 
-### Tier 5: Jev Self-Evaluation
+### Terminal strategy: `decision`
 
-- **Capability-Level Judgment:** Jev determines whether it can handle the incoming request. A positive result handles the request; an ineligible or failed evaluation escalates to Tier 6.
-- **Recursive Architecture:** The cascade progressively asks increasingly capable systems whether generation is actually necessary, culminating in the unusual case where Jev evaluates whether Jev can solve the problem.
+- **Typed decision execution:** The terminal dispatcher sends the request's typed `state` and `questions` to the configured Decision provider.
+- **Provider and model identity:** The current provider is Ollaya. The model is configured independently (default `laya:en`).
+- **Eligibility:** Ollaya evaluates the caller's typed questions and an injected Jev-eligibility question in one request. A rejected or failed Decision attempt proceeds to `generative` when that strategy is enabled.
 
-### Tier 6: Generative LLM Fallback
-- **Open-Ended Generation:** Tier 6 handles requests that survive every discriminative tier or inherently require open-ended language generation, synthesis, or reasoning.
-- **Terminal Stage:** The router dispatches unresolved requests here; provider availability determines whether a response can be returned.
-- **Expensive by Design:** The generative model is deliberately reserved for the residual traffic that earlier tiers cannot confidently establish as JEV-capable, minimizing unnecessary token consumption while preserving full LLM capability for genuinely generative requests.
+### Terminal strategy: `generative`
+
+- **Open-ended generation:** The Generative strategy handles requests that require open-ended language generation, synthesis, or reasoning, as well as requests that the Decision strategy rejects or cannot serve.
+- **Provider and model identity:** The current provider is Ollama. The model is configured independently (default `gemma3:latest`).
+- **Dispatch semantics:** Every attempted terminal strategy is recorded in order. The separate final-result record identifies the strategy, provider, model and status that ultimately produced the caller's response, or the terminal failure if no response was produced.
+
+### Strategy and provider ontology
+
+The complete Strategy enum contains exactly five values: `rules`, `fasttext`, `encoder`, `decision`, and `generative`. Ollaya and Ollama are provider identities, not strategies. Model IDs such as `laya:en` and `gemma3:latest` are neither strategies nor provider names.
 ---
 
 ## Latency Budget and Target Coverage
 
 Latency figures are per-tier p99 budgets. Coverage figures are **design targets** for the share of traffic each tier should resolve. Actual values depend on your traffic mix and must be measured (see [Benchmarking](#benchmarking) and [Observability](#observability)).
 
-| Tier | Engine | p99 Budget | Target Coverage |
+| Strategy | Execution | p99 Budget | Target Coverage |
 | :--- | :--- | :--- | :--- |
-| 1 | `regex::RegexSet` and hash maps | < 0.1 ms | 25% to 35% |
-| 2 | FastText subword (`libfasttext`) | 0.2 ms to 0.4 ms | 40% to 50% |
-| 3 | ModernBERT via ONNX Runtime sidecar | TBD | TBD |
-| 4 | Harrier sidecar over gRPC | 1.5 ms to 8.0 ms | 15% to 25% |
-| 5 | Jev self-evaluation | 20 ms to 50 ms | 3% to 5% |
-| 6 | Frontier LLM | Variable | < 1% |
+| `rules` | `regex::RegexSet` and hash maps | < 0.1 ms | 25% to 35% |
+| `fasttext` | FastText subword (`libfasttext`) | 0.2 ms to 0.4 ms | 40% to 50% |
+| `encoder` | Configured encoder model via gRPC | TBD | TBD |
 
-Note that the 5 ms SLA holds for traffic that exits at tiers 1 to 4 within their lower budget range. The upper end of tier 4 (8 ms), tier 5, and tier 6 intentionally exceed it, which is why keeping their coverage small matters.
+The 5 ms target applies to requests resolved by the cascade-scoring strategies within their measured budgets. Terminal Decision and Generative invocation latencies are reported separately and depend on the selected provider and model.
 
 ---
 
@@ -174,8 +177,8 @@ src/
     tier2.rs          Learned Decision Tier (FastText subword classifier)
     tier3_runner.rs   (ModernBERT ONNX runtime stub)
     tier4.rs          Micro-Transformer / Embedding Evaluators (gRPC client using GGUF) 
-    tier5_runner.rs   Jev Self-evaluation
-    tier6_runner.rs   Generative LLM Fallback
+    decision_runner.rs   Typed Jev decision execution
+    generative_runner.rs Ollama-backed generative execution
   tier3/
     calibration.rs    Margin calculation and probability calibration
     trait.rs          Core evaluator trait and contract definitions
@@ -203,7 +206,7 @@ src/
 
 ## Configuration
 
-At startup, the router reads `config/router.toml`. Set `enabled = true` for each tier that should be constructed and used; omitted tiers default to disabled. Override the config file path with `ROUTER_CONFIG`.
+At startup, the router reads `config/router.toml`. The `tier1` through `tier4` blocks configure the historical cascade executors. The named `decision` and `generative` blocks configure terminal execution strategies. Omitted strategies default to disabled. Override the config file path with `ROUTER_CONFIG`.
 
 ```toml
 [router.tier1]
@@ -218,14 +221,20 @@ enabled = true
 [router.tier4]
 enabled = true
 
-[router.tier5]
+[router.decision]
 enabled = true
+endpoint = "http://127.0.0.1:11435/api/decide"
+model = "laya:en"
+timeout_ms = 120000
 
-[router.tier6]
+[router.generative]
 enabled = true
+endpoint = "http://127.0.0.1:11434/api/generate"
+model = "gemma3:latest"
+timeout_ms = 120000
 ```
 
-Tier 1 rules and model/backend locations continue to use their existing environment variables and `config/tier1.toml`; the master file controls whether each tier is constructed. At least one tier must be enabled. If a request reaches a disabled downstream tier, the router returns an explicit downstream error rather than invoking it.
+Rules and model/backend locations continue to use their existing environment variables and configuration. The `decision` and `generative` blocks independently enable their terminal strategy. A Decision failure may fall back to Generative when it is enabled. If the required terminal strategy is disabled or both providers fail, the router returns an explicit gateway error.
 
 When Tier 3 is enabled, run the ModernBERT sidecar separately. It loads `models/modernbert-base/model_int8.onnx` and `models/modernbert-base/tokenizer.json` at startup and listens on port `50052` by default:
 
@@ -344,6 +353,18 @@ The suite should cover, at minimum:
 - Payload bound rejection at tier 1
 - Calibration math in `calibration.rs`
 
+
+### End-to-end validation
+
+The test suites prove different contracts:
+
+- `cargo test --all-targets` validates deterministic router behavior using local HTTP stubs, including Decision success, rejection, transport failure, timeout, Generative success/failure, and disabled strategies.
+- `bash tests/clickhouse/migration-smoke.sh` applies migrations 001-006 to a scratch database and verifies historical strategy/provider normalization, including `cascade_decision_tier = 6` remaining `fallback` and unavailable historical model IDs remaining NULL.
+- `bash tests/e2e/it-support-live.sh` exercises the configured real `laya:en` and `gemma3:latest` models, the account/password and VPN scenarios, the exact 20-leaf taxonomy, and request-correlated ClickHouse persistence.
+- `scripts/smoke-jev-ch.sh` remains the separate arithmetic/ClickHouse acceptance test. The IT-support scenarios are additive and do not replace it.
+
+The live smoke requires the router, Ollaya, Ollama, and ClickHouse to be running locally, with migration 006 applied. Its expected leaf categories are `account_pw` and `nw_vpn`; both are checked against the taxonomy file rather than a broad-domain label.
+
 ---
 
 ## Benchmarking
@@ -382,26 +403,22 @@ Verbosity is controlled via RUST_LOG. The default level is info.
 Recommended production configuration:
 ```RUST_LOG=info,cascade_router=debug```
 
-Tracking **resolved-at-tier distribution over time** is the most important signal. A shift of traffic toward tiers 4 through 6 means thresholds, models, or the input distribution have drifted, and both cost and tail latency will rise.
+Tracking **resolved-at-tier distribution over time** is the most important signal. A shift of traffic toward the encoder stage and terminal execution means thresholds, models, or the input distribution have drifted, and both cost and tail latency will rise.
 
 ### Request Capture
 
-Each completed route is sent through a bounded, non-blocking Tokio channel to a background writer, which appends one JSON object per line to `logs/routing_capture.jsonl` and inserts it into ClickHouse's `route_records_raw` table. If that queue is full, the record is dropped with a warning rather than delaying the response. ClickHouse insert failures are logged and the local spool is retained for replay. The log directory is created at startup. The record includes a UUID v4 request ID, the request-start UTC timestamp, the raw prompt, SHA-256 hashes of the Tier 1 TOML and Tier 2 model files, outcomes from tiers that ran, the cascade decision tier, and the final backend, downstream tier, and latency. Tier 2 records its raw probability vector; tiers 3 and 4 record their scores. The sampling probability currently defaults to `1.0`.
+Each completed route is sent through a bounded, non-blocking Tokio channel to a background writer, which appends one JSON object per line to `logs/routing_capture.jsonl` and inserts it into ClickHouse's `route_records_raw` table. Each record contains the request ID, timestamp, prompt, cascade tier outcomes, ordered `dispatch_attempts`, and a distinct `final_result`. An attempt records strategy, provider, model ID, outcome, latency, and failure reason. The final result records the strategy/provider/model that produced the response, or the terminal failure. The legacy `cascade_decision_tier` value 6 means `fallback`; it is not the Generative strategy. Migration 006 projects these semantics into `route_execution_results`. Historical records without model identity retain a NULL model ID. ClickHouse insert failures are logged and the local spool is retained for replay.
 
 The raw prompt is stored verbatim and may contain sensitive data. Restrict access to the capture file and define appropriate retention and cleanup; the writer appends indefinitely and does not rotate the file.
 
 ### Running the Gateway
 
 `cargo run --release` starts the HTTP gateway on `127.0.0.1:8080` by default. It exposes
-`GET /healthz`, `POST /v1/completions`, and `POST /v1/decisions`. Prompt-only requests are sent
-to the configured generative model. Structured requests may include `state` and `questions`; when the cascade
-selects Jev, Ollaya/Laya is asked to assess Jev eligibility and answer those typed questions in
-one decision request. If Jev is not eligible or the Laya call fails, the request falls through to
-the Gemma/Ollama generator.
+`GET /healthz`, `POST /v1/completions`, and `POST /v1/decisions`. Prompt-only requests are classified and can route directly to the Generative strategy. Structured requests may include `state` and `questions`; when classification selects Decision, Ollaya/Laya receives those typed questions and an injected eligibility question in one request. An ineligible or failed Decision attempt can fall back to the configured Generative strategy. Each attempt and the final result record provider and model identity independently.
 
 ```bash
 docker run -d --name ollaya -p 11435:11435 ghcr.io/ollaya-dev/ollaya
-ollaya run laya
+ollaya run laya:en
 ollama pull gemma3:latest
 ollama pull qwen3:1.7b
 cargo run --release
@@ -415,9 +432,10 @@ responses. Spool lines remain available for manual replay if ClickHouse is unava
 
 The principal runtime overrides are `ROUTER_BIND`, `MODERNBERT_ENDPOINT` (default
 `http://[::1]:50052`), `TIER4_HARRIER_ENDPOINT` (falls back to
-`TIER3_ENDPOINT` for compatibility), `TIER5_ENDPOINT` (falls back to `TIER4_ENDPOINT`, default
-`http://127.0.0.1:11435/api/decide`), `OLLAMA_GENERATE_URL` (default
-`http://127.0.0.1:11434/api/generate`), `GEMMA_MODEL` (default `gemma3:latest`),
+`TIER3_ENDPOINT` for compatibility), `DECISION_ENDPOINT` (default
+`http://127.0.0.1:11435/api/decide`), `DECISION_MODEL` (default `laya:en`),
+`GENERATIVE_ENDPOINT` (default `http://127.0.0.1:11434/api/generate`),
+`GENERATIVE_MODEL` (default `gemma3:latest`),
 `TAGGER_OLLAMA_URL` (default `http://127.0.0.1:11434`), `TAGGER_MODEL` (default
 `qwen3:1.7b`), and `CLICKHOUSE_URL` (default `http://127.0.0.1:8123`).
 
@@ -472,16 +490,16 @@ Engines must not allocate on the per-request hot path where avoidable, and must 
 
 - **Tier pass-through:** low confidence is not an error. It is the normal escalation path.
 - **Model load failure at startup:** the router should fail fast rather than silently run with a tier missing. Disabling a tier must be an explicit configuration choice.
-- **Encoder timeout:** encoder timeouts and RPC failures pass through to Jev Tier 5.
-- **Tier 5 failure:** Jev ineligibility or failure falls through to the generative Tier 6 endpoint when enabled.
-- **Tier 6 unavailable:** the terminal tier is an external dependency; provider failures return an explicit gateway error.
+- **Encoder timeout:** encoder timeouts and RPC failures pass through to route fallback.
+- **Decision rejection or failure:** a failed Decision attempt is recorded and may fall through to Generative when enabled.
+- **Generative unavailable:** provider failures return an explicit gateway error; the record preserves all attempted strategies and the terminal failure.
 - **Oversize or malformed payloads:** rejected at tier 1 based on `max_payload_bytes`.
 
 ---
 
 ## Known Constraints
 
-- The 5 ms p99 SLA applies to traffic resolved within tiers 1 to 4 at the lower end of tier 4's range. Tiers 5 and 6 exceed it by design.
+- The 5 ms p99 target applies to traffic resolved by the three cascade strategies. Terminal Decision and Generative latency is measured separately.
 - Coverage percentages are targets, not guarantees.
 - AVX-512 and NEON acceleration depend on the host CPU. Throughput and latency on other hardware will differ.
 - Thresholds are coupled to specific model artifacts. Swapping or retraining a model requires recalibration.

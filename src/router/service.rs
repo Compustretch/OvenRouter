@@ -5,14 +5,14 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use axum::{
-    extract::State,
-    http::StatusCode,
-    response::IntoResponse,
+    extract::{rejection::JsonRejection, State},
+    http::{HeaderMap, HeaderValue, StatusCode},
+    response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
 };
 use chrono::Utc;
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer};
 use serde_json::{json, Map, Value};
 use tokio::sync::mpsc;
 use tracing::warn;
@@ -20,7 +20,9 @@ use uuid::Uuid;
 
 use crate::legacy_tiers::LegacyTierNumbers;
 use crate::pipeline::cascade::{CascadeGraph, Slot};
-use crate::pipeline::tier::{TierId, FALLBACK_TIER_NAME};
+use crate::pipeline::tier::FALLBACK_TIER_NAME;
+#[cfg(test)]
+use crate::pipeline::tier::TierId;
 use crate::pipeline::runner::{CascadeRunner, Resolution, RunOutcome, TierTrace};
 use crate::pipeline::tagger::JointTagStore;
 use crate::pipeline::task::{
@@ -28,13 +30,14 @@ use crate::pipeline::task::{
 };
 use crate::tagging::{is_sampled, TagInput, TagQueue};
 use crate::telemetry::{
-    FinalRouting, Hashes, RouteRecord, Sampling, Tier1Outcome as Tier1Record,
-    TaskDecisionRecord, TaskLabelScore, TierOutcomeRecord, Tier2Outcome as Tier2Record, Tier3Outcome as Tier3Record, Tier4Outcome as Tier4Record,
+    DispatchAttemptRecord, FinalResultRecord, FinalRouting, Hashes, RouteRecord, Sampling,
+    Tier1Outcome as Tier1Record, TaskDecisionRecord, TaskLabelScore, TierOutcomeRecord,
+    Tier2Outcome as Tier2Record, Tier3Outcome as Tier3Record, Tier4Outcome as Tier4Record,
 };
 
 use super::{
-    cascade::Backend,
-    dispatch::{downstream_tier_name, DownstreamDispatcher},
+    cascade::Strategy,
+    dispatch::{DispatchAttempt, DownstreamDispatcher, FinalResult},
 };
 
 pub struct AppDependencies {
@@ -77,8 +80,15 @@ pub struct AppState {
     legacy: Arc<LegacyTierNumbers>,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct RequestContext {
+    request_id: Uuid,
+}
+
 #[derive(Deserialize)]
 pub struct CompletionRequest {
+    #[serde(default, deserialize_with = "deserialize_request_id")]
+    request_id: Option<Uuid>,
     prompt: Option<String>,
     messages: Option<Vec<ChatMessage>>,
     model: Option<String>,
@@ -129,8 +139,90 @@ pub fn app(dependencies: AppDependencies) -> Router {
 
 async fn completion(
     State(state): State<AppState>,
-    Json(request): Json<CompletionRequest>,
-) -> impl IntoResponse {
+    headers: HeaderMap,
+    request: Result<Json<CompletionRequest>, JsonRejection>,
+) -> Response {
+    let request = match request {
+        Ok(Json(request)) => request,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({
+                    "error": "invalid_request",
+                    "detail": "request body must be valid JSON and request_id, when present, must be a UUID"
+                })),
+            )
+                .into_response();
+        }
+    };
+
+    let request_context = match resolve_request_context(&headers, request.request_id) {
+        Ok(context) => context,
+        Err(detail) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": "invalid_request", "detail": detail})),
+            )
+                .into_response();
+        }
+    };
+
+    let response = complete(state, request, &request_context).await;
+    attach_request_id(response, &request_context)
+}
+
+fn deserialize_request_id<'de, D>(deserializer: D) -> Result<Option<Uuid>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Uuid::deserialize(deserializer).map(Some)
+}
+
+fn resolve_request_context(
+    headers: &HeaderMap,
+    body_request_id: Option<Uuid>,
+) -> Result<RequestContext, &'static str> {
+    let mut values = headers.get_all("x-request-id").iter();
+    let header_value = values.next();
+    if values.next().is_some() {
+        return Err("X-Request-ID must be supplied at most once");
+    }
+
+    let header_request_id = match header_value {
+        Some(value) => {
+            let raw = value
+                .to_str()
+                .map_err(|_| "X-Request-ID must contain a valid UUID")?;
+            Some(Uuid::parse_str(raw)
+                .map_err(|_| "X-Request-ID must contain a valid UUID")?)
+        }
+        None => None,
+    };
+
+    let request_id = match (header_request_id, body_request_id) {
+        (Some(header), Some(body)) if header != body => {
+            return Err("X-Request-ID conflicts with JSON request_id");
+        }
+        (Some(header), _) => header,
+        (None, Some(body)) => body,
+        (None, None) => Uuid::new_v4(),
+    };
+
+    Ok(RequestContext { request_id })
+}
+
+fn attach_request_id(mut response: Response, context: &RequestContext) -> Response {
+    let value = HeaderValue::from_str(&context.request_id.to_string())
+        .expect("canonical UUID text is a valid HTTP header value");
+    response.headers_mut().insert("x-request-id", value);
+    response
+}
+
+async fn complete(
+    state: AppState,
+    request: CompletionRequest,
+    request_context: &RequestContext,
+) -> Response {
     if request.stream == Some(true) {
         return (
             StatusCode::BAD_REQUEST,
@@ -215,7 +307,7 @@ async fn completion(
 
     // Mint the correlation ID before any inference. The identical ID controls
     // deterministic sampling and joins route/task records in ClickHouse.
-    let request_id = Uuid::new_v4().to_string();
+    let request_id = request_context.request_id.to_string();
     let route_started = Instant::now();
     let include_joint_tag = state.tag_in_request
         && state.tag_profile.is_some()
@@ -258,21 +350,21 @@ async fn completion(
             "cascade tier completed"
         );
     }
-    let (backend, mut record) =
+    let (strategy, mut record) =
         route_record(request_id, &route_input, &state.hashes, &state.cascade_order, &state.legacy, &request_profiles, &outcome, route_started);
 
     tracing::info!(
         request_id = %record.request_id,
-        backend = %backend,
+        strategy = strategy.as_str(),
         decided_by_tier = record.cascade_decision_tier,
-        "dispatching completion request to downstream backend"
+        "dispatching completion request to terminal strategy"
     );
 
     match state
         .dispatcher
         .execute(
             &record.request_id,
-            backend,
+            strategy,
             &fallback_prompt,
             request.state.as_ref(),
             request.questions.as_ref(),
@@ -287,23 +379,7 @@ async fn completion(
             };
             let response_text = payload.to_string();
             let request_id = record.request_id.clone();
-            record.final_routing.backend = downstream_tier_name(result.tier).into();
-            record.final_routing.tier = result.tier;
-            record.final_routing.tier_name = downstream_tier_name(result.tier).into();
-            record.final_routing.latency_us += result.request_latency.as_micros();
-            record.downstream_invocation_latency_ms =
-                result.invocation_latency.as_secs_f64() * 1000.0;
-            record.downstream_outcome = Some(result.outcome.into());
-            record.downstream_tier = Some(format!("tier{}", result.tier));
-            record.is_failover = result.is_failover;
-            record.failure_reason = result.failure_reason;
-            if result.is_failover {
-                record.request_latency_failover_ms =
-                    Some(result.request_latency.as_secs_f64() * 1000.0);
-            } else {
-                record.request_latency_primary_ms =
-                    Some(result.request_latency.as_secs_f64() * 1000.0);
-            }
+            apply_dispatch_result(&mut record, &result.attempts, &result.final_result, result.request_latency);
             capture(&state.capture_tx, record);
             state.tag_queue.enqueue(TagInput {
                 request_id,
@@ -315,20 +391,7 @@ async fn completion(
         Err(error) => {
             let detail = error.error.to_string();
             let request_id = record.request_id.clone();
-            record.final_routing.backend = "llm".into();
-            record.final_routing.tier = error.tier;
-            record.final_routing.tier_name = downstream_tier_name(error.tier).into();
-            record.final_routing.latency_us += error.request_latency.as_micros();
-            record.downstream_invocation_latency_ms =
-                error.invocation_latency.as_secs_f64() * 1000.0;
-            record.downstream_outcome = Some(error.outcome.into());
-            record.downstream_tier = Some(format!("tier{}", error.tier));
-            record.is_failover = error.is_failover;
-            record.failure_reason = Some(error.failure_reason);
-            if error.is_failover {
-                record.request_latency_failover_ms =
-                    Some(error.request_latency.as_secs_f64() * 1000.0);
-            }
+            apply_dispatch_result(&mut record, &error.attempts, &error.final_result, error.request_latency);
             capture(&state.capture_tx, record);
             state.tag_queue.enqueue(TagInput {
                 request_id,
@@ -358,21 +421,21 @@ fn route_record(
     profiles: &[Task],
     outcome: &RunOutcome,
     started: Instant,
-) -> (Backend, RouteRecord) {
+) -> (Strategy, RouteRecord) {
     let route_outcome = outcome.tasks.get(&String::from("route"));
     // The numeric value is the legacy ordinal (0 for a tier without one); the
     // name is the identity. Fallback keeps its historical value of 6.
-    let (backend, decision_tier, decision_tier_name, decision_tier_id) = match route_outcome.map(|task| &task.resolution) {
+    let (strategy, decision_tier, decision_tier_name, decision_tier_id) = match route_outcome.map(|task| &task.resolution) {
         Some(Resolution::Tier { tier_id, tier, reading, .. }) => (
-            backend_for_label(&reading.label),
+            strategy_for_label(&reading.label),
             legacy.ordinal_of(tier).unwrap_or(0),
             tier.to_string(),
             tier_id.to_string(),
         ),
         Some(Resolution::Fallback { label }) => {
-            (backend_for_label(label), 6, FALLBACK_TIER_NAME.to_string(), String::new())
+            (strategy_for_label(label), 6, FALLBACK_TIER_NAME.to_string(), String::new())
         }
-        Some(Resolution::Deferred) | None => (Backend::Llm, 6, FALLBACK_TIER_NAME.to_string(), String::new()),
+        Some(Resolution::Deferred) | None => (Strategy::Generative, 6, FALLBACK_TIER_NAME.to_string(), String::new()),
     };
 
     let trace = route_outcome.map(|task| task.trace.as_slice()).unwrap_or(&[]);
@@ -467,8 +530,10 @@ fn route_record(
         cascade_decision_tier: decision_tier,
         decided_by_tier_name: decision_tier_name.clone(),
         decided_by_tier_id: decision_tier_id,
+        dispatch_attempts: Vec::new(),
+        final_result: None,
         final_routing: FinalRouting {
-            backend: backend.to_string(),
+            backend: String::new(),
             tier: decision_tier,
             tier_name: decision_tier_name,
             latency_us,
@@ -484,14 +549,61 @@ fn route_record(
         sampling: Sampling::default(),
     };
 
-    (backend, record)
+    (strategy, record)
 }
 
-fn backend_for_label(label: &str) -> Backend {
+fn strategy_for_label(label: &str) -> Strategy {
     if label == LABEL_JEV {
-        Backend::Jev
+        Strategy::Decision
     } else {
-        Backend::Llm
+        Strategy::Generative
+    }
+}
+
+/// Copy the dispatch result into canonical telemetry and legacy projections.
+/// Dispatch attempts and final_result are authoritative. The old flat fields
+/// remain only for consumers that have not yet moved to the new columns.
+fn apply_dispatch_result(
+    record: &mut RouteRecord,
+    attempts: &[DispatchAttempt],
+    final_result: &FinalResult,
+    request_latency: Duration,
+) {
+    record.dispatch_attempts = attempts.iter().map(|attempt| DispatchAttemptRecord {
+        strategy: attempt.strategy.as_str().to_string(),
+        provider: attempt.provider.map(|provider| provider.as_str().to_string()),
+        model_id: attempt.model_id.clone(),
+        outcome: attempt.outcome.clone(),
+        latency_ms: attempt.latency.as_secs_f64() * 1000.0,
+        failure_reason: attempt.failure_reason.clone(),
+    }).collect();
+    record.final_result = Some(FinalResultRecord {
+        strategy: final_result.strategy.as_str().to_string(),
+        provider: final_result.provider.map(|provider| provider.as_str().to_string()),
+        model_id: final_result.model_id.clone(),
+        status: final_result.status.to_string(),
+        failure_reason: final_result.failure_reason.clone(),
+    });
+
+    record.final_routing.backend = final_result.provider
+        .map(|provider| provider.as_str()).unwrap_or("").to_string();
+    // Keep cascade_decision_tier as a cascade ordinal only. In particular,
+    // the historic value 6 means fallback; it never means Generative.
+    record.final_routing.tier = record.cascade_decision_tier;
+    record.final_routing.tier_name = record.decided_by_tier_name.clone();
+    record.final_routing.latency_us += request_latency.as_micros();
+    record.downstream_invocation_latency_ms = attempts.iter()
+        .map(|attempt| attempt.latency.as_secs_f64() * 1000.0)
+        .sum();
+    record.downstream_outcome = Some(final_result.status.to_string());
+    record.downstream_tier = Some(final_result.strategy.as_str().to_string());
+    record.is_failover = attempts.len() > 1;
+    record.failure_reason = attempts.iter()
+        .find_map(|attempt| attempt.failure_reason.clone());
+    if record.is_failover {
+        record.request_latency_failover_ms = Some(request_latency.as_secs_f64() * 1000.0);
+    } else {
+        record.request_latency_primary_ms = Some(request_latency.as_secs_f64() * 1000.0);
     }
 }
 
@@ -886,9 +998,9 @@ mod tests {
     }
 
     #[test]
-    fn downstream_backends_are_named_by_what_they_run() {
-        assert_eq!(downstream_tier_name(5), "jev");
-        assert_eq!(downstream_tier_name(6), "llm");
+    fn terminal_strategy_names_are_distinct_from_provider_names() {
+        assert_eq!(Strategy::Decision.as_str(), "decision");
+        assert_eq!(Strategy::Generative.as_str(), "generative");
     }
 
     #[test]
@@ -901,4 +1013,88 @@ mod tests {
         assert!(parsed.tier_outcomes.is_empty());
         assert_eq!(parsed.final_routing.tier_name, "");
     }
+
+    #[test]
+    fn request_id_resolution_obeys_header_and_json_contract() {
+        let id = Uuid::parse_str("123e4567-e89b-42d3-a456-426614174000").unwrap();
+        let same_upper = id.to_string().to_uppercase();
+        let mut headers = HeaderMap::new();
+        headers.insert("x-request-id", HeaderValue::from_str(&id.to_string()).unwrap());
+        assert_eq!(resolve_request_context(&headers, None).unwrap().request_id, id);
+        headers.clear();
+        assert_eq!(resolve_request_context(&headers, Some(id)).unwrap().request_id, id);
+        let body_request = serde_json::from_value::<CompletionRequest>(json!({
+            "request_id": id.to_string(),
+            "prompt": "body compatibility"
+        })).unwrap();
+        assert_eq!(body_request.request_id, Some(id));
+
+        headers.insert("x-request-id", HeaderValue::from_str(&same_upper).unwrap());
+        assert_eq!(resolve_request_context(&headers, Some(id)).unwrap().request_id, id);
+
+        let other = Uuid::parse_str("123e4567-e89b-42d3-a456-426614174001").unwrap();
+        assert_eq!(resolve_request_context(&headers, Some(other)).unwrap_err(),
+            "X-Request-ID conflicts with JSON request_id");
+    }
+
+    #[test]
+    fn request_id_resolution_rejects_malformed_and_duplicate_headers() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-request-id", HeaderValue::from_static("not-a-uuid"));
+        assert_eq!(resolve_request_context(&headers, None).unwrap_err(),
+            "X-Request-ID must contain a valid UUID");
+        headers.clear();
+        headers.append("x-request-id", HeaderValue::from_static("123e4567-e89b-42d3-a456-426614174000"));
+        headers.append("x-request-id", HeaderValue::from_static("123e4567-e89b-42d3-a456-426614174001"));
+        assert_eq!(resolve_request_context(&headers, None).unwrap_err(),
+            "X-Request-ID must be supplied at most once");
+    }
+
+    #[test]
+    fn absent_request_id_generates_a_unique_v4_uuid() {
+        let first = resolve_request_context(&HeaderMap::new(), None).unwrap().request_id;
+        let second = resolve_request_context(&HeaderMap::new(), None).unwrap().request_id;
+        assert_ne!(first, second);
+        assert_eq!(first.get_version_num(), 4);
+        assert_eq!(second.get_version_num(), 4);
+    }
+
+    #[test]
+    fn response_contains_the_resolved_request_id() {
+        let id = Uuid::parse_str("123e4567-e89b-42d3-a456-426614174000").unwrap();
+        let context = RequestContext { request_id: id };
+        let response = attach_request_id(
+            (StatusCode::OK, Json(json!({"ok": true}))).into_response(),
+            &context,
+        );
+        assert_eq!(response.headers().get("x-request-id").unwrap().to_str().unwrap(), id.to_string());
+    }
+
+    #[test]
+    fn explicit_null_json_request_id_is_rejected() {
+        let parsed = serde_json::from_value::<CompletionRequest>(json!({
+            "request_id": null,
+            "prompt": "body compatibility"
+        }));
+        assert!(parsed.is_err());
+    }
+
+    #[tokio::test]
+    async fn concurrent_request_contexts_keep_distinct_ids() {
+        let first_id = Uuid::parse_str("123e4567-e89b-42d3-a456-426614174000").unwrap();
+        let second_id = Uuid::parse_str("123e4567-e89b-42d3-a456-426614174001").unwrap();
+        let mut first_headers = HeaderMap::new();
+        first_headers.insert("x-request-id", HeaderValue::from_str(&first_id.to_string()).unwrap());
+        let mut second_headers = HeaderMap::new();
+        second_headers.insert("x-request-id", HeaderValue::from_str(&second_id.to_string()).unwrap());
+
+        let (first, second) = tokio::join!(
+            async { resolve_request_context(&first_headers, None).unwrap() },
+            async { resolve_request_context(&second_headers, None).unwrap() },
+        );
+        assert_eq!(first.request_id, first_id);
+        assert_eq!(second.request_id, second_id);
+        assert_ne!(first.request_id, second.request_id);
+    }
+
 }
