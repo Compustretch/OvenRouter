@@ -152,7 +152,7 @@ fn find_tier<'a>(tiers: &'a [TierConfig], legacy: &LegacyTierNumbers, reference:
 }
 
 /// The compatibility numbering: `[legacy_tiers]` if present; otherwise the
-/// original four-tier numbering when no `[[tier]]` is declared; otherwise none.
+/// default rules/fastText/encoder numbering when no `[[tier]]` is declared.
 fn legacy_numbers_from(
     declared: Option<BTreeMap<String, u8>>,
     tiers: &[TierConfig],
