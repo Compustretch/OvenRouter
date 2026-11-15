@@ -1,6 +1,8 @@
 
 ![OvenRouter](/assets/oven_router_logo.png)
 
+<i>"Not all prompts need to be baked at the same temperature."</i>
+
 ## Cascade Router Engine
 
 An in-process, high-throughput request routing engine written in Rust. It classifies incoming prompts and routes them to discriminative (Jev) or generative (LLM) execution pathways with a **p99 decision latency under 5 ms** for the overwhelming majority of traffic.
