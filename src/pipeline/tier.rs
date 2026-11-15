@@ -191,6 +191,16 @@ pub struct Tier {
 impl Tier {
     /// A definition is coherent when its strategy, transport and request shape agree.
     pub fn validate(&self) -> Result<(), &'static str> {
+        match (self.strategy.is_cascade_strategy(), self.strategy.is_terminal()) {
+            (true, false) => {}
+            (false, true) => {
+                return Err("decision and generative are terminal execution strategies, not cascade tiers");
+            }
+            _ => {
+                return Err("every strategy must belong to exactly one of the cascade or terminal sets");
+            }
+        }
+
         match (self.strategy, self.transport, self.request_shape) {
             (Strategy::Rules | Strategy::FastText, Transport::InProcess, None) => Ok(()),
             (Strategy::Rules | Strategy::FastText, _, _) => {

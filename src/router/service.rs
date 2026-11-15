@@ -20,7 +20,9 @@ use uuid::Uuid;
 
 use crate::legacy_tiers::LegacyTierNumbers;
 use crate::pipeline::cascade::{CascadeGraph, Slot};
-use crate::pipeline::tier::{TierId, FALLBACK_TIER_NAME};
+use crate::pipeline::tier::FALLBACK_TIER_NAME;
+#[cfg(test)]
+use crate::pipeline::tier::TierId;
 use crate::pipeline::runner::{CascadeRunner, Resolution, RunOutcome, TierTrace};
 use crate::pipeline::tagger::JointTagStore;
 use crate::pipeline::task::{

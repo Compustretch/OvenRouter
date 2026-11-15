@@ -313,6 +313,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let pipeline_config =
         pipeline::config::load_or_default(env_or("TASKS_CONFIG", "config/tasks.toml"))?;
+    if !pipeline_config.has_policy("route") {
+        return Err("tasks.toml: route task has no configured tier policy".into());
+    }
     // ---- Build the complete available-tier registry -----------------------
     // [[tier]] supplies definitions; its array order has no execution meaning.
     let mut registry = TierRegistry::new();
@@ -346,7 +349,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     for (name, by_task) in &pipeline_config.tier_policies {
         if let Some(id) = execution_graph.id_for_name(name) {
             let eligible: std::collections::BTreeMap<_, _> = by_task.iter()
-                .filter(|(task, _)| execution_graph.task_uses(task, &id))
+                .filter(|(task, _)| execution_graph.tasks_using(&id)
+                    .is_some_and(|users| users.contains(*task)))
                 .map(|(task, policy)| (task.clone(), policy.clone()))
                 .collect();
             if !eligible.is_empty() {
@@ -359,10 +363,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if execution_graph.order().is_empty() {
         return Err("no enabled task cascade contains an available tier".into());
     }
+    let task_path_transitions = execution_graph.dependencies()
+        .map(|edge| (
+            execution_graph.tier_name(&edge.from).map(ToString::to_string),
+            execution_graph.tier_name(&edge.to).map(ToString::to_string),
+            edge.tasks.into_iter().collect::<Vec<_>>(),
+        ))
+        .collect::<Vec<_>>();
     tracing::info!(
         order = ?execution_graph.order().iter()
             .filter_map(|id| execution_graph.tier_name(id).map(ToString::to_string))
             .collect::<Vec<_>>(),
+        task_path_transitions = ?task_path_transitions,
         "compiled task cascade graph"
     );
 
