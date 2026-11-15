@@ -1016,6 +1016,12 @@ mod tests {
         assert_eq!(resolve_request_context(&headers, None).unwrap().request_id, id);
         headers.clear();
         assert_eq!(resolve_request_context(&headers, Some(id)).unwrap().request_id, id);
+        let body_request = serde_json::from_value::<CompletionRequest>(json!({
+            "request_id": id.to_string(),
+            "prompt": "body compatibility"
+        })).unwrap();
+        assert_eq!(body_request.request_id, Some(id));
+
         headers.insert("x-request-id", HeaderValue::from_str(&same_upper).unwrap());
         assert_eq!(resolve_request_context(&headers, Some(id)).unwrap().request_id, id);
 
