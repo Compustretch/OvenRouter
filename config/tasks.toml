@@ -29,8 +29,9 @@ fallback = "defer"
 #                by the selected sidecar, passed through the transport
 #   config       rules: rule file
 #
-# `model` / `config` fall back to FASTTEXT_MODEL / TIER1_CONFIG for a definition
-# that declares none. `scorer` is accepted as an alias of `encoder`.
+# fastText `model` and rules `config` fall back to FASTTEXT_MODEL and
+# TIER1_CONFIG respectively. Encoder `model` is mandatory. `scorer` is an
+# accepted alias of `encoder`.
 
 [[tier]]
 name = "rules"
