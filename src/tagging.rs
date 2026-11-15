@@ -1070,9 +1070,9 @@ mod tests {
                 .unwrap_or("")
                 .trim().to_string();
             let _ = tx.send(request_id);
-            let body = r#"{"message":{"content":"{\\"status\\":\\"tagged\\",\\"primary\\":{\\"category_id\\":\\"help_desk\\",\\"score\\":0.9},\\"alternatives\\":[]}"}}"#;
+            let body = r#"{"message":{"content":"{\"status\":\"tagged\",\"primary\":{\"category_id\":\"help_desk\",\"score\":0.9},\"alternatives\":[]}"}}"#;
             let response = format!(
-                "HTTP/1.1 200 OK\\r\\ncontent-type: application/json\\r\\ncontent-length: {}\\r\\nconnection: close\\r\\n\\r\\n{}",
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
                 body.len(), body
             );
             let _ = stream.write_all(response.as_bytes()).await;
