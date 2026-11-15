@@ -694,6 +694,11 @@ mod tests {
             &self,
             _request: Request<ScoreRequest>,
         ) -> Result<Response<ScoreResponse>, Status> {
+            assert_eq!(
+                request.metadata().get("x-jev-model").and_then(|value| value.to_str().ok()),
+                Some("test-sidecar"),
+                "the tier-selected model must reach the sidecar transport",
+            );
             self.score_calls.fetch_add(1, Ordering::SeqCst);
             Ok(Response::new(ScoreResponse {
                 raw_score: 0.97,
@@ -707,6 +712,11 @@ mod tests {
             &self,
             request: Request<ScoreTasksRequest>,
         ) -> Result<Response<ScoreTasksResponse>, Status> {
+            assert_eq!(
+                request.metadata().get("x-jev-model").and_then(|value| value.to_str().ok()),
+                Some("test-sidecar"),
+                "the tier-selected model must reach the sidecar transport",
+            );
             self.tasks_calls.fetch_add(1, Ordering::SeqCst);
             if !self.joint {
                 return Err(Status::unimplemented("no multi-task heads"));
