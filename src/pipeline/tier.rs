@@ -394,7 +394,13 @@ impl TierInstance {
                     .ok_or_else(|| format!("tier {name}: encoder tier has no endpoint"))?;
                 let timeout_ms = params.timeout_ms
                     .ok_or_else(|| format!("tier {name}: encoder tier has no timeout_ms"))?;
-                (Runner::Grpc(Tier3Runner::new(endpoint, Duration::from_millis(timeout_ms))?), None)
+                let model = params.model.as_deref()
+                    .ok_or_else(|| format!("tier {name}: encoder tier has no concrete model selection"))?;
+                (Runner::Grpc(Tier3Runner::new(
+                    endpoint,
+                    model,
+                    Duration::from_millis(timeout_ms),
+                )?), None)
             }
         };
         Ok(Self::assemble(name, tier, params, runner, artifact_hash))
@@ -874,7 +880,7 @@ mod tests {
     async fn joint_sidecar_scores_multiple_tasks_in_one_rpc() {
         let sidecar = TestSidecar { joint: true, ..Default::default() };
         let calls = sidecar.tasks_calls.clone();
-        let scorer = Tier3Runner::new(endpoint(sidecar).await, Duration::from_secs(2)).unwrap();
+        let scorer = Tier3Runner::new(endpoint(sidecar).await, "test-sidecar", Duration::from_secs(2)).unwrap();
         let tier = TierInstance::encoder("alternate", RequestShape::ScoreTasks, None, scorer);
         let tasks = [String::from("route"), String::from("tag")];
         let profiles = [
@@ -909,7 +915,7 @@ mod tests {
         let sidecar = TestSidecar { joint: true, ..Default::default() };
         let task_calls = sidecar.tasks_calls.clone();
         let score_calls = sidecar.score_calls.clone();
-        let scorer = Tier3Runner::new(endpoint(sidecar).await, Duration::from_secs(2)).unwrap();
+        let scorer = Tier3Runner::new(endpoint(sidecar).await, "test-sidecar", Duration::from_secs(2)).unwrap();
         let tier = TierInstance::encoder("route-scorer", RequestShape::ScoreTasks, None, scorer);
         let tasks = [String::from("route")];
         let profiles = [Task {
@@ -937,7 +943,7 @@ mod tests {
         let sidecar = TestSidecar { joint: false, ..Default::default() };
         let task_calls = sidecar.tasks_calls.clone();
         let score_calls = sidecar.score_calls.clone();
-        let scorer = Tier3Runner::new(endpoint(sidecar).await, Duration::from_secs(2)).unwrap();
+        let scorer = Tier3Runner::new(endpoint(sidecar).await, "test-sidecar", Duration::from_secs(2)).unwrap();
         let tier = TierInstance::encoder("no-joint", RequestShape::ScoreTasks, None, scorer);
         let tasks = [String::from("route")];
         let profiles = [Task {
