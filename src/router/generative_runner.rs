@@ -21,7 +21,7 @@ impl GenerativeRunner {
         })
     }
 
-    pub async fn invoke(&self, prompt: &str) -> Result<(Value, Duration), DownstreamError> {
+    pub async fn invoke(&self, request_id: &str, prompt: &str) -> Result<(Value, Duration), DownstreamError> {
         let start = Instant::now();
         let payload = serde_json::json!({
             "model": &self.model,
@@ -32,6 +32,7 @@ impl GenerativeRunner {
         let response = self
             .client
             .post(&self.endpoint)
+            .header("X-Request-ID", request_id)
             .json(&payload)
             .send()
             .await

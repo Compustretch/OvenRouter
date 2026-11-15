@@ -278,6 +278,7 @@ impl Tagger for OvenV1Tagger {
         let model = self.model.clone();
         let categories = self.categories.clone();
         let prompt = input.prompt.clone();
+        let request_id = input.request_id.clone();
         let response = input.response.clone().unwrap_or_default();
 
         async move {
@@ -311,6 +312,7 @@ impl Tagger for OvenV1Tagger {
             let url = format!("{}/api/chat", base_url.trim_end_matches('/'));
             let response = client
                 .post(url)
+                .header("X-Request-ID", &request_id)
                 .json(&request_body)
                 .send()
                 .await
@@ -1050,4 +1052,42 @@ mod tests {
         );
         assert!(records[0].tagger_usage.is_none());
     }
+    #[tokio::test]
+    async fn tagger_propagates_request_id_in_http_header() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0u8; 8192];
+            let n = stream.read(&mut request).await.unwrap_or(0);
+            let text = String::from_utf8_lossy(&request[..n]).to_ascii_lowercase();
+            let request_id = text.lines()
+                .find_map(|line| line.strip_prefix("x-request-id: "))
+                .unwrap_or("")
+                .trim().to_string();
+            let _ = tx.send(request_id);
+            let body = r#"{"message":{"content":"{\\"status\\":\\"tagged\\",\\"primary\\":{\\"category_id\\":\\"help_desk\\",\\"score\\":0.9},\\"alternatives\\":[]}"}}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\\r\\ncontent-type: application/json\\r\\ncontent-length: {}\\r\\nconnection: close\\r\\n\\r\\n{}",
+                body.len(), body
+            );
+            let _ = stream.write_all(response.as_bytes()).await;
+        });
+
+        let request_id = "123e4567-e89b-42d3-a456-426614174000";
+        let tagger = OvenV1Tagger::new(format!("http://{address}"), "test-model");
+        let result = tagger.tag(&TagInput {
+            request_id: request_id.into(),
+            prompt: "Help me reset my password".into(),
+            response: None,
+        }).await.unwrap();
+        assert!(matches!(result.verdict,
+            TaggerVerdict::Tagged { primary, .. } if primary.category_id == "help_desk"));
+        assert_eq!(rx.await.unwrap(), request_id);
+    }
+
 }

@@ -146,7 +146,7 @@ impl DownstreamDispatcher {
                 };
 
                 let decision_result = match (state, questions) {
-                    (Some(state), Some(questions)) => decision.invoke(state, questions).await,
+                    (Some(state), Some(questions)) => decision.invoke(request_id, state, questions).await,
                     _ => Err(DownstreamError::InvalidResponse(
                         "typed decision request requires both state and questions".into(),
                     )),
@@ -259,7 +259,7 @@ impl DownstreamDispatcher {
             });
         };
 
-        match generative.invoke(prompt).await {
+        match generative.invoke(request_id, prompt).await {
             Ok((payload, elapsed)) => {
                 attempts.push(DispatchAttempt {
                     strategy: Strategy::Generative,
@@ -395,6 +395,32 @@ mod tests {
             }
         });
         format!("http://{address}/")
+    }
+
+    async fn stub_capture_request_id(
+        body: &'static str,
+    ) -> (String, tokio::sync::oneshot::Receiver<String>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            if let Ok((mut stream, _)) = listener.accept().await {
+                let mut request = [0u8; 8192];
+                let n = stream.read(&mut request).await.unwrap_or(0);
+                let text = String::from_utf8_lossy(&request[..n]).to_ascii_lowercase();
+                let request_id = text.lines()
+                    .find_map(|line| line.strip_prefix("x-request-id: "))
+                    .unwrap_or("")
+                    .trim().to_string();
+                let _ = tx.send(request_id);
+                let response = format!(
+                    "HTTP/1.1 200 OK\\r\\ncontent-type: application/json\\r\\ncontent-length: {}\\r\\nconnection: close\\r\\n\\r\\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+            }
+        });
+        (format!("http://{address}/"), rx)
     }
 
     fn dispatcher(decision: String, generative: String, timeout: Duration) -> DownstreamDispatcher {
@@ -536,4 +562,22 @@ mod tests {
         assert_eq!(error.attempts[0].outcome, "disabled");
         assert_eq!(error.final_result.failure_reason.as_deref(), Some("generative_disabled"));
     }
+    #[tokio::test]
+    async fn request_id_is_identical_on_decision_and_generative_fallback() {
+        let (decision, decision_id) = stub_capture_request_id(
+            r#"{"answers":{"answer":{"choice":"other","confidence":0.8},"__router_jev_eligible":{"choice":"no","confidence":0.99}}}"#
+        ).await;
+        let (generative, generative_id) = stub_capture_request_id(r#"{"response":"fallback"}"#).await;
+        let router = dispatcher(decision, generative, Duration::from_millis(500));
+        let (state, questions) = decision_request();
+        let request_id = "123e4567-e89b-42d3-a456-426614174000";
+        let result = router.execute(request_id, Strategy::Decision, "prompt", Some(&state), Some(&questions))
+            .await.unwrap();
+        assert_eq!(result.attempts.len(), 2);
+        assert_eq!(result.attempts[0].strategy, Strategy::Decision);
+        assert_eq!(result.attempts[1].strategy, Strategy::Generative);
+        assert_eq!(decision_id.await.unwrap(), request_id);
+        assert_eq!(generative_id.await.unwrap(), request_id);
+    }
+
 }

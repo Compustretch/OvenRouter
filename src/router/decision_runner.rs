@@ -107,6 +107,7 @@ impl DecisionRunner {
 
     pub async fn invoke(
         &self,
+        request_id: &str,
         state: &Value,
         questions: &serde_json::Map<String, Value>,
     ) -> Result<(Value, Duration), DownstreamError> {
@@ -135,6 +136,7 @@ impl DecisionRunner {
             let response = self
                 .client
                 .post(&self.endpoint)
+                .header("X-Request-ID", request_id)
                 .json(&json!({
                     "model": &self.model,
                     "state": state,

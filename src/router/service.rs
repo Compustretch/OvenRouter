@@ -5,9 +5,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use axum::{
-    extract::State,
-    http::StatusCode,
-    response::IntoResponse,
+    extract::{rejection::JsonRejection, State},
+    http::{HeaderMap, HeaderValue, StatusCode},
+    response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
 };
@@ -80,8 +80,15 @@ pub struct AppState {
     legacy: Arc<LegacyTierNumbers>,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct RequestContext {
+    request_id: Uuid,
+}
+
 #[derive(Deserialize)]
 pub struct CompletionRequest {
+    #[serde(default)]
+    request_id: Option<Uuid>,
     prompt: Option<String>,
     messages: Option<Vec<ChatMessage>>,
     model: Option<String>,
@@ -132,8 +139,83 @@ pub fn app(dependencies: AppDependencies) -> Router {
 
 async fn completion(
     State(state): State<AppState>,
-    Json(request): Json<CompletionRequest>,
-) -> impl IntoResponse {
+    headers: HeaderMap,
+    request: Result<Json<CompletionRequest>, JsonRejection>,
+) -> Response {
+    let request = match request {
+        Ok(Json(request)) => request,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({
+                    "error": "invalid_request",
+                    "detail": "request body must be valid JSON and request_id, when present, must be a UUID"
+                })),
+            )
+                .into_response();
+        }
+    };
+
+    let request_context = match resolve_request_context(&headers, request.request_id) {
+        Ok(context) => context,
+        Err(detail) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": "invalid_request", "detail": detail})),
+            )
+                .into_response();
+        }
+    };
+
+    let response = complete(state, request, &request_context).await;
+    attach_request_id(response, &request_context)
+}
+
+fn resolve_request_context(
+    headers: &HeaderMap,
+    body_request_id: Option<Uuid>,
+) -> Result<RequestContext, &'static str> {
+    let mut values = headers.get_all("x-request-id").iter();
+    let header_value = values.next();
+    if values.next().is_some() {
+        return Err("X-Request-ID must be supplied at most once");
+    }
+
+    let header_request_id = match header_value {
+        Some(value) => {
+            let raw = value
+                .to_str()
+                .map_err(|_| "X-Request-ID must contain a valid UUID")?;
+            Some(Uuid::parse_str(raw)
+                .map_err(|_| "X-Request-ID must contain a valid UUID")?)
+        }
+        None => None,
+    };
+
+    let request_id = match (header_request_id, body_request_id) {
+        (Some(header), Some(body)) if header != body => {
+            return Err("X-Request-ID conflicts with JSON request_id");
+        }
+        (Some(header), _) => header,
+        (None, Some(body)) => body,
+        (None, None) => Uuid::new_v4(),
+    };
+
+    Ok(RequestContext { request_id })
+}
+
+fn attach_request_id(mut response: Response, context: &RequestContext) -> Response {
+    let value = HeaderValue::from_str(&context.request_id.to_string())
+        .expect("canonical UUID text is a valid HTTP header value");
+    response.headers_mut().insert("x-request-id", value);
+    response
+}
+
+async fn complete(
+    state: AppState,
+    request: CompletionRequest,
+    request_context: &RequestContext,
+) -> Response {
     if request.stream == Some(true) {
         return (
             StatusCode::BAD_REQUEST,
@@ -218,7 +300,7 @@ async fn completion(
 
     // Mint the correlation ID before any inference. The identical ID controls
     // deterministic sampling and joins route/task records in ClickHouse.
-    let request_id = Uuid::new_v4().to_string();
+    let request_id = request_context.request_id.to_string();
     let route_started = Instant::now();
     let include_joint_tag = state.tag_in_request
         && state.tag_profile.is_some()
@@ -924,4 +1006,55 @@ mod tests {
         assert!(parsed.tier_outcomes.is_empty());
         assert_eq!(parsed.final_routing.tier_name, "");
     }
+
+    #[test]
+    fn request_id_resolution_obeys_header_and_json_contract() {
+        let id = Uuid::parse_str("123e4567-e89b-42d3-a456-426614174000").unwrap();
+        let same_upper = id.to_string().to_uppercase();
+        let mut headers = HeaderMap::new();
+        headers.insert("x-request-id", HeaderValue::from_str(&id.to_string()).unwrap());
+        assert_eq!(resolve_request_context(&headers, None).unwrap().request_id, id);
+        headers.clear();
+        assert_eq!(resolve_request_context(&headers, Some(id)).unwrap().request_id, id);
+        headers.insert("x-request-id", HeaderValue::from_str(&same_upper).unwrap());
+        assert_eq!(resolve_request_context(&headers, Some(id)).unwrap().request_id, id);
+
+        let other = Uuid::parse_str("123e4567-e89b-42d3-a456-426614174001").unwrap();
+        assert_eq!(resolve_request_context(&headers, Some(other)).unwrap_err(),
+            "X-Request-ID conflicts with JSON request_id");
+    }
+
+    #[test]
+    fn request_id_resolution_rejects_malformed_and_duplicate_headers() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-request-id", HeaderValue::from_static("not-a-uuid"));
+        assert_eq!(resolve_request_context(&headers, None).unwrap_err(),
+            "X-Request-ID must contain a valid UUID");
+        headers.clear();
+        headers.append("x-request-id", HeaderValue::from_static("123e4567-e89b-42d3-a456-426614174000"));
+        headers.append("x-request-id", HeaderValue::from_static("123e4567-e89b-42d3-a456-426614174001"));
+        assert_eq!(resolve_request_context(&headers, None).unwrap_err(),
+            "X-Request-ID must be supplied at most once");
+    }
+
+    #[test]
+    fn absent_request_id_generates_a_unique_v4_uuid() {
+        let first = resolve_request_context(&HeaderMap::new(), None).unwrap().request_id;
+        let second = resolve_request_context(&HeaderMap::new(), None).unwrap().request_id;
+        assert_ne!(first, second);
+        assert_eq!(first.get_version_num(), 4);
+        assert_eq!(second.get_version_num(), 4);
+    }
+
+    #[test]
+    fn response_contains_the_resolved_request_id() {
+        let id = Uuid::parse_str("123e4567-e89b-42d3-a456-426614174000").unwrap();
+        let context = RequestContext { request_id: id };
+        let response = attach_request_id(
+            (StatusCode::OK, Json(json!({"ok": true}))).into_response(),
+            &context,
+        );
+        assert_eq!(response.headers().get("x-request-id").unwrap().to_str().unwrap(), id.to_string());
+    }
+
 }
