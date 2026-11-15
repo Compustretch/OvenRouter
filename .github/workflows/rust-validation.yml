@@ -33,14 +33,21 @@ jobs:
     services:
       clickhouse:
         image: clickhouse/clickhouse-server:25.3
+        env:
+          CLICKHOUSE_USER: ci_smoke
+          CLICKHOUSE_PASSWORD: ci_smoke
+          CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: 1
         ports:
           - 8123:8123
     steps:
       - uses: actions/checkout@v4
       - name: Wait for ClickHouse
+        env:
+          CLICKHOUSE_USER: ci_smoke
+          CLICKHOUSE_PASSWORD: ci_smoke
         run: |
           for attempt in $(seq 1 60); do
-            if curl --silent --fail http://127.0.0.1:8123/ping; then
+            if curl --silent --fail --user "$CLICKHOUSE_USER:$CLICKHOUSE_PASSWORD" http://127.0.0.1:8123/ping; then
               exit 0
             fi
             sleep 2
@@ -50,4 +57,6 @@ jobs:
       - name: Run clean-install and historical migration smoke
         env:
           CLICKHOUSE_URL: http://127.0.0.1:8123
+          CLICKHOUSE_USER: ci_smoke
+          CLICKHOUSE_PASSWORD: ci_smoke
         run: bash tests/clickhouse/migration-smoke.sh

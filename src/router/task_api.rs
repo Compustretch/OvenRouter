@@ -415,6 +415,9 @@ mod tests {
                 Strategy::FastText => (Transport::InProcess, None, None, Some("test-fasttext".into()), None, None, None),
                 Strategy::Encoder => (Transport::Grpc, Some(RequestShape::Score), Some(ModelFormat::Onnx),
                     Some(name.into()), None, Some("http://127.0.0.1:9".into()), Some(250)),
+                Strategy::Decision | Strategy::Generative => {
+                    unreachable!("terminal strategies cannot be task-cascade tiers")
+                }
             };
         (
             tname(name),

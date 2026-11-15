@@ -456,6 +456,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let generative_timeout = Duration::from_millis(
         config.router.generative.timeout_ms.unwrap_or(default_execution_timeout_ms),
     );
+    let downstream_timeout = decision_timeout.max(generative_timeout);
     let dispatcher = DownstreamDispatcher::new_with_enabled(
         decision_endpoint,
         decision_model,
