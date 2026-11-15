@@ -103,6 +103,9 @@ fn tier_configs_from(raw: Vec<RawTier>) -> Result<Vec<TierConfig>, Box<dyn Error
         if definition.exex == Role::Encoder && tier.model_format.is_none() {
             return Err(format!("[[tier]] {label:?}: encoder must declare model_format (onnx or gguf)").into());
         }
+        if definition.exex == Role::Encoder && tier.model.as_deref().is_none_or(str::is_empty) {
+            return Err(format!("[[tier]] {label:?}: encoder must declare a concrete model identifier in `model`").into());
+        }
         if !definition.accepts(tier.model_format) {
             return Err(format!("[[tier]] {label:?}: model_format {:?} is incompatible with {} executor", tier.model_format.map(ModelFormat::as_str), definition.exex.as_str()).into());
         }
