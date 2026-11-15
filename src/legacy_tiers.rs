@@ -36,11 +36,11 @@ impl LegacyTierNumbers {
         Ok(Self { by_name })
     }
 
-    /// The numbering of the original four-tier path, for configuration that
-    /// declares no `[[tier]]` entries.
-    pub fn original_four() -> Self {
+    /// The default compatibility numbering for configurations without
+    /// explicit tier declarations: rules, fasttext, then the encoder.
+    pub fn original_three() -> Self {
         Self::new(
-            [("rules", 1), ("fasttext", 2), ("modernbert", 3), ("harrier", 4)]
+            [("rules", 1), ("fasttext", 2), ("encoder", 3)]
                 .map(|(name, ordinal)| (TierName::new(name).expect("built-in tier names are valid"), ordinal)),
         )
         .expect("built-in numbering is valid")
@@ -76,9 +76,9 @@ mod tests {
     }
 
     #[test]
-    fn the_original_numbering_is_the_four_shipped_tiers() {
-        let map = LegacyTierNumbers::original_four();
-        assert_eq!(map.name_of(4), Some(&tname("harrier")));
+    fn default_numbering_maps_the_single_encoder_to_tier_three() {
+        let map = LegacyTierNumbers::original_three();
+        assert_eq!(map.name_of(3), Some(&tname("encoder")));
         assert_eq!(map.ordinal_of(&tname("fasttext")), Some(2));
     }
 }
