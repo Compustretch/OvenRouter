@@ -174,11 +174,18 @@ migration() {
 insert_jsonl() {
     local path="$1"
     local sql="INSERT INTO ${DATABASE}.route_records_raw FORMAT JSONAsString"
-    local encoded
+    local encoded line line_number response
     encoded="$(jq -rn --arg q "$sql" '$q | @uri')"
-    curl_ch --request POST "${CLICKHOUSE_URL}/?query=${encoded}" --data-binary "@${path}" >/dev/null
+    line_number=0
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        [[ -z "$line" ]] && continue
+        line_number=$((line_number + 1))
+        if ! response="$(curl_ch --request POST "${CLICKHOUSE_URL}/?query=${encoded}" --data-binary "$line" 2>&1)"; then
+            printf '%s\n' "$response" >&2
+            fail "Could not insert JSON fixture line $line_number from $path"
+        fi
+    done < "$path"
 }
-
 cleanup() {
     local sql="DROP DATABASE IF EXISTS ${DATABASE} SYNC"
     local encoded

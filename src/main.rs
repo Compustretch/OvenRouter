@@ -528,10 +528,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Ok::<(), std::io::Error>(())
     });
 
-    let ollama_tagger = OvenV1Tagger::new(
-        env_or("TAGGER_OLLAMA_URL", "http://127.0.0.1:11434"),
-        env_or("TAGGER_MODEL", "qwen3:1.7b"),
-    );
+    let tagger_url = env_or("TAGGER_OLLAMA_URL", "http://127.0.0.1:11434");
+    let tagger_model = env_or("TAGGER_MODEL", "qwen3:1.7b");
+    let ollama_tagger = match runtime_tasks.iter().find(|task| task.name == "tag") {
+        Some(task) if task.labels.as_ref().is_some_and(|labels| !labels.is_empty()) =>
+            OvenV1Tagger::for_task(tagger_url, tagger_model, task).map_err(std::io::Error::other)?,
+        _ => OvenV1Tagger::new(tagger_url, tagger_model),
+    };
     let tag_sample_prob: f32 = env_or("TAG_SAMPLE_PROB", "1.0").parse()?;
     if !tag_sample_prob.is_finite() || !(0.0..=1.0).contains(&tag_sample_prob) {
         return Err("TAG_SAMPLE_PROB must be between 0 and 1".into());

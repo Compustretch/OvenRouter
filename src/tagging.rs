@@ -32,6 +32,8 @@ use tokio::sync::{mpsc, Semaphore};
 use tokio::task::JoinHandle;
 use tracing::warn;
 
+use crate::pipeline::task::Task;
+
 // ---------------------------------------------------------------------------
 // Schema
 // ---------------------------------------------------------------------------
@@ -205,6 +207,11 @@ pub struct OvenV1Tagger {
     client: reqwest::Client,
     base_url: String,
     model: String,
+    /// Closed-set labels and their discriminating criteria. Configured task
+    /// taxonomies replace the old broad-domain V1 labels.
+    categories: Vec<(String, String)>,
+    taxonomy_version: String,
+    tagger_id: String,
 }
 
 impl OvenV1Tagger {
@@ -213,13 +220,48 @@ impl OvenV1Tagger {
             client: reqwest::Client::new(),
             base_url: base_url.into(),
             model: model.into(),
+            categories: V1_DOMAINS.iter().map(|id| ((*id).to_string(), (*id).to_string())).collect(),
+            taxonomy_version: "v1.0".into(),
+            tagger_id: "oven-domain-tagger-v1".into(),
         }
+    }
+
+    /// Build a taxonomy-aware tagger from the configured [task.tag] contract.
+    /// The taxonomy labels/criteria have already been loaded and validated by
+    /// pipeline::config, so this uses exactly the leaf set configured for the task.
+    pub fn for_task(
+        base_url: impl Into<String>,
+        model: impl Into<String>,
+        task: &Task,
+    ) -> Result<Self, String> {
+        let labels = task.labels.as_ref()
+            .filter(|labels| !labels.is_empty())
+            .ok_or_else(|| format!("task.{} has no configured taxonomy labels", task.name))?;
+        let categories: Vec<_> = labels.iter().map(|id| {
+            let criterion = task.label_metadata.iter()
+                .find(|metadata| metadata.id == *id)
+                .map(|metadata| metadata.classifier_criterion.clone())
+                .filter(|criterion| !criterion.trim().is_empty())
+                .unwrap_or_else(|| id.clone());
+            (id.clone(), criterion)
+        }).collect();
+        if categories.len() != categories.iter().map(|(id, _)| id).collect::<std::collections::BTreeSet<_>>().len() {
+            return Err(format!("task.{} contains duplicate taxonomy labels", task.name));
+        }
+        Ok(Self {
+            client: reqwest::Client::new(),
+            base_url: base_url.into(),
+            model: model.into(),
+            categories,
+            taxonomy_version: task.taxonomy_version.clone().unwrap_or_else(|| "unknown".into()),
+            tagger_id: format!("{}-taxonomy-tagger", task.name),
+        })
     }
 }
 
 impl Tagger for OvenV1Tagger {
     fn model(&self) -> &str {
-        "oven-domain-tagger-v1"
+        &self.tagger_id
     }
 
     fn version(&self) -> &str {
@@ -227,18 +269,22 @@ impl Tagger for OvenV1Tagger {
     }
 
     fn taxonomy_version(&self) -> &str {
-        "v1.0"
+        &self.taxonomy_version
     }
 
     fn tag(&self, input: &TagInput) -> impl Future<Output = Result<TaggerOutput, TagError>> + Send {
         let client = self.client.clone();
         let base_url = self.base_url.clone();
         let model = self.model.clone();
+        let categories = self.categories.clone();
         let prompt = input.prompt.clone();
         let response = input.response.clone().unwrap_or_default();
 
         async move {
-            let taxonomy = V1_DOMAINS.join(", ");
+            let taxonomy = categories.iter()
+                .map(|(id, criterion)| format!("- {id}: {criterion}"))
+                .collect::<Vec<_>>()
+                .join("\n");
             let request_body = serde_json::json!({
                 "model": model,
                 "stream": false,
@@ -247,7 +293,7 @@ impl Tagger for OvenV1Tagger {
                     {
                         "role": "system",
                         "content": format!(
-                            "You are a domain classifier for OvenRouter. Return exactly one valid JSON object with the shape {{\"status\":\"tagged\",\"primary\":{{\"category_id\":\"<one of the allowed ids>\",\"score\":1.0}},\"alternatives\":[]}}. Allowed categories: {}. Choose the single best category for the provided request. Do not add explanatory text or markdown fences.",
+                            "Classify the task pursued by the current request using the configured closed-set taxonomy. Return exactly one valid JSON object with the shape {{\"status\":\"tagged\",\"primary\":{{\"category_id\":\"<one configured leaf id>\",\"score\":1.0}},\"alternatives\":[]}}. Allowed taxonomy leaves and classifier criteria:\n{}. Choose exactly one leaf ID, apply each classifier criterion as the discriminating rule, and prefer the most specific defensible leaf. Do not return broad domains, group names, or labels outside this taxonomy. Task category is independent of Jev eligibility. Do not add explanatory text or markdown fences.",
                             taxonomy
                         )
                     },
@@ -304,7 +350,7 @@ impl Tagger for OvenV1Tagger {
                 .get("primary")
                 .and_then(|primary| primary.get("category_id"))
                 .and_then(serde_json::Value::as_str)
-                .filter(|id| V1_DOMAINS.contains(id))
+                .filter(|id| categories.iter().any(|(allowed, _)| allowed.as_str() == *id))
                 .ok_or_else(|| {
                     TagError::Failed("tagger did not return a valid category id".to_string())
                 })?;
@@ -735,6 +781,49 @@ mod tests {
 
     fn by_id<'a>(records: &'a [TagRecord], id: &str) -> &'a TagRecord {
         records.iter().find(|r| r.request_id == id).unwrap()
+    }
+
+    #[test]
+    fn task_taxonomy_replaces_the_broad_domain_leaf_set() {
+        let task = Task {
+            name: "tag".into(),
+            cascade: Default::default(),
+            output_kind: crate::pipeline::task::OutputKind::Multiclass,
+            labels: Some(vec!["account_pw".into(), "nw_vpn".into()]),
+            label_metadata: vec![
+                crate::pipeline::task::TaskLabelMetadata {
+                    id: "account_pw".into(),
+                    name: "Password reset".into(),
+                    description: "Reset a password or unlock an account".into(),
+                    classifier_criterion: "Reset credentials or unlock an account".into(),
+                    group_id: None,
+                },
+                crate::pipeline::task::TaskLabelMetadata {
+                    id: "nw_vpn".into(),
+                    name: "VPN connectivity".into(),
+                    description: "Network and VPN access".into(),
+                    classifier_criterion: "Diagnose VPN or network connectivity".into(),
+                    group_id: None,
+                },
+            ],
+            taxonomy_version: Some("1.1.0".into()),
+            fallback: crate::pipeline::task::FallbackPolicy::Defer,
+        };
+        let tagger = OvenV1Tagger::for_task(
+            "http://127.0.0.1:11434",
+            "qwen3:1.7b",
+            &task,
+        ).unwrap();
+
+        assert_eq!(tagger.taxonomy_version(), "1.1.0");
+        assert_eq!(tagger.model(), "tag-taxonomy-tagger");
+        assert_eq!(
+            tagger.categories,
+            vec![
+                ("account_pw".into(), "Reset credentials or unlock an account".into()),
+                ("nw_vpn".into(), "Diagnose VPN or network connectivity".into()),
+            ]
+        );
     }
 
     #[tokio::test]
