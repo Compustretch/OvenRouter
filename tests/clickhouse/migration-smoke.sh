@@ -173,7 +173,7 @@ migration() {
 }
 insert_jsonl() {
     local path="$1"
-    local sql="INSERT INTO ${DATABASE}.route_records_raw FORMAT JSONAsString"
+    local sql="INSERT INTO ${DATABASE}.route_records_raw (line) FORMAT JSONAsString"
     local encoded line line_number response
     encoded="$(jq -rn --arg q "$sql" '$q | @uri')"
     line_number=0
