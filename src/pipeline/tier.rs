@@ -846,7 +846,7 @@ mod tests {
     }
 
     #[test]
-    fn a_model_format_that_does_not_fit_the_role_is_rejected() {
+    fn a_model_format_that_does_not_fit_the_strategy_is_rejected() {
         let (name, tier, mut params) = rules_config("rules-a", Some("config/tier1.toml"));
         params.model_format = Some(ModelFormat::Onnx);
         let error = TierInstance::build(name, tier, params).err().expect("must fail");
