@@ -201,8 +201,8 @@ impl Tier {
 pub struct Params {
     /// Encoder only: selects the inference runtime at the adapter boundary.
     pub model_format: Option<ModelFormat>,
-    /// fasttext: path to the model file. encoder: the model name the sidecar is
-    /// expected to report; a different `model_id` in a response is logged once.
+    /// fasttext: path to the model file. encoder: the concrete model identifier
+    /// passed to the sidecar by the transport formatter.
     pub model: Option<String>,
     /// Rules only: path to the rule file.
     pub config: Option<String>,
