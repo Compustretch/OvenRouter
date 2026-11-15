@@ -1,52 +1,86 @@
-# Task definitions and task/tier resolution policies are separate concerns.
-# [task.*] describes a prediction objective only; no tier IDs belong here.
-# [tier_policy.tierN.*] configures when a particular execution tier may resolve it.
+# Each task owns an ordered cascade of TierNames. CascadeGraph materializes
+# the referenced TierInstances and compiles shared task paths into a DAG.
 
 [pipeline]
-# The normal OvenV1Tagger remains the default tagger. Enable only after a sidecar
-# has a trained `tag` head and matching tier policies are configured below.
 tag_via_cascade = false
 tag_in_request = false
-# Must remain below TagConfig.call_timeout (5 seconds).
 tag_budget_ms = 4000
-# Local scorer tiers whose sidecars support the joint ScoreTasks RPC.
-joint_tiers = []
 
 [task.route]
+cascade = ["rules", "fasttext", "encoder"]
 labels = ["jev_capable", "needs_llm"]
 fallback_label = "needs_llm"
 
 [task.tag]
+cascade = ["encoder"]
 output_kind = "multiclass"
 taxonomy = "../taskonomies/help_desk.json"
 fallback = "defer"
 
-# Route resolution calibration. Tier 1 and Tier 2 remain route-only scorers;
-# tiers 3 and 4 may serve any task for which their sidecar exposes a head.
-[tier_policy.tier1.route]
+# Each [[tier]] is an available Tier definition, addressed by TierName. The
+# registry catalogs definitions; task cascades select which definitions the
+# CascadeGraph materializes as TierInstances with hash-derived TierIds.
+#
+#   strategy     which strategy handles the tier: rules | fasttext | encoder
+#   transport    how the router reaches it: in_process | grpc
+#   request_shape  encoder only: the RPC contract, score | score_tasks
+#   model_format  encoder model serialization/runtime: onnx | gguf
+#   model        fasttext: model file; encoder: concrete model identifier served
+#                by the selected sidecar, passed through the transport
+#   config       rules: rule file
+#
+# fastText `model` and rules `config` fall back to FASTTEXT_MODEL and
+# TIER1_CONFIG respectively. Encoder `model` is mandatory. `scorer` is an
+# accepted alias of `encoder`.
+
+[[tier]]
+name = "rules"
+strategy = "rules"
+transport = "in_process"
+
+[[tier]]
+name = "fasttext"
+strategy = "fasttext"
+transport = "in_process"
+
+[[tier]]
+name = "encoder"
+strategy = "encoder"
+model = "modernbert-onnx"
+model_format = "onnx"
+transport = "grpc"
+request_shape = "score_tasks"
+
+# Compatibility only. Before tiers had names the original four were numbered;
+# the numbered telemetry fields (tier1_outcome .. tier4_outcome,
+# cascade_decision_tier, resolving_tier), the [router.tierN] settings in
+# router.toml, the numbered environment variables and `tierN` aliases in
+# [tier_policy.*] keys still use those numbers. This table is the only place a
+# name and a number meet; no tier, instance or cascade type carries it.
+[legacy_tiers]
+rules = 1
+fasttext = 2
+encoder = 3
+
+# Calibration belongs to a tier name + task pair. A policy may record the
+# instance it was fitted on with `calibrated_for = "<TierId, 32 hex>"`; the
+# startup compares it with the TierInstance materialized on the graph.
+# `authority = "observe"` records a tier's reading for a task without ever
+# resolving it, for heads that are logged rather than routed.
+[tier_policy.rules.route]
 min_confidence = 0.78
 strict = true
 never_resolve = ["needs_llm"]
 
-[tier_policy.tier2.route]
+[tier_policy.fasttext.route]
 min_confidence = 0.95
 never_resolve = ["needs_llm"]
 
-[tier_policy.tier3.route]
+[tier_policy.encoder.route]
 min_confidence = 0.95
 label_min_confidence = { jev_capable = 0.95, needs_llm = 0.70 }
 
-[tier_policy.tier4.route]
-min_confidence = 0.95
-label_min_confidence = { jev_capable = 0.95, needs_llm = 0.70 }
 
-# Enable after one configured joint sidecar has a trained tag head.
-# Tagging is best-effort and shares the route request's cascade run.
-#
-# [tier_policy.tier3.tag]
-# min_confidence = 0.85
-#
-# [tier_policy.tier4.tag]
-# min_confidence = 0.85
-#
-# Set pipeline.tag_in_request = true and include the relevant tier in joint_tiers.
+# The route and tag heads share one encoder invocation through ScoreTasks.
+[tier_policy.encoder.tag]
+min_confidence = 0.85
