@@ -24,7 +24,10 @@ jobs:
           sudo apt-get install -y build-essential clang cmake pkg-config protobuf-compiler
       - uses: Swatinem/rust-cache@v2
       - name: Validate smoke-script syntax
-        run: bash -n scripts/smoke-jev-ch.sh tests/e2e/it-support-live.sh tests/clickhouse/migration-smoke.sh
+        run: |
+          for script in scripts/smoke-jev-ch.sh tests/e2e/it-support-live.sh tests/clickhouse/migration-smoke.sh; do
+            bash -n "$script"
+          done
 
       - name: Check production binary without test configuration
         env:
