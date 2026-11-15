@@ -207,8 +207,6 @@ impl CascadeGraph {
         registry: &TierRegistry,
     ) -> Result<Self, CascadeGraphError> {
         let mut graph = Self::default();
-        let mut successors: BTreeMap<TierId, BTreeSet<TierId>> = BTreeMap::new();
-        let mut indegree: BTreeMap<TierId, usize> = BTreeMap::new();
         let mut first_seen: BTreeMap<TierId, usize> = BTreeMap::new();
         let mut next_rank = 0usize;
 
@@ -280,8 +278,6 @@ impl CascadeGraph {
                     id
                 };
 
-                successors.entry(id).or_default();
-                indegree.entry(id).or_insert(0);
                 if !first_seen.contains_key(&id) {
                     first_seen.insert(id, next_rank);
                     next_rank += 1;
@@ -295,12 +291,27 @@ impl CascadeGraph {
                 let to = edge[1];
                 graph.progression_edges.entry((from, to)).or_default()
                     .insert(task.name.clone());
-                if successors.entry(from).or_default().insert(to) {
-                    *indegree.entry(to).or_insert(0) += 1;
-                }
             }
 
             graph.paths.insert(task.name.clone(), path_ids);
+        }
+
+        // Build the temporary traversal adjacency exclusively from the canonical
+        // task-transition provenance map. No second edge representation is stored.
+        let mut successors: BTreeMap<TierId, BTreeSet<TierId>> = graph.instances.keys()
+            .map(|id| (*id, BTreeSet::new()))
+            .collect();
+        let mut indegree: BTreeMap<TierId, usize> = graph.instances.keys()
+            .map(|id| (*id, 0))
+            .collect();
+        for ((from, to), _) in &graph.progression_edges {
+            if successors.get_mut(from)
+                .expect("every materialized tier has an adjacency entry")
+                .insert(*to)
+            {
+                *indegree.get_mut(to)
+                    .expect("every materialized tier has an indegree entry") += 1;
+            }
         }
 
         // Preserve first appearance in task cascades as the deterministic tie-break.
