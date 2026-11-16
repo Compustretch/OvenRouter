@@ -6,6 +6,21 @@
 <i>"Not all prompts need to be baked at the same temperature."</i>
 </p>
 
+## Summary
+
+OvenRouter is a configurable, multi-task inference and routing engine written in Rust. Organizations can define and add task heads to a shared cascade, giving each task its own output contract, ordered evaluation path, confidence policies, and fallback behavior.
+
+Rather than building a separate inference pipeline for every classification problem, OvenRouter compiles the configured task paths into a shared execution graph. Tasks reuse available tier instances, progress independently through their own cascades, and can execute compatible model-backed heads together through a single encoder representation.
+
+This makes OvenRouter a general-purpose foundation for organizational AI inference. A single deployment can evaluate distinct tasks such as tool requirements, help-desk categories, urgency, and other domain-specific classifications without requiring a separate routing system for each.
+
+Its first major application is organizational tool routing. A binary `tool_requirement` task determines whether a request needs an external tool. Requests that do not proceed directly to generative inference; requests that do enter Jev's tool-selection path, followed by generative tool execution.
+i
+If we were to reduce it to a mantra it would be: **Define the tasks. Share the cascade. Route the work.**
+
+
+
+
 An in-process, high-throughput request-routing engine written in Rust. It
 classifies incoming prompts and determines **whether the prompt requires a tool
 call**, then routes accordingly: prompts that need tools enter a tool-executing
