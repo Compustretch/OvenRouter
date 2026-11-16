@@ -21,6 +21,40 @@ irreversibility, off the path of requests that don't require it.
 
 > **Implementation status:** `master` is in transition. The current runtime still uses the legacy `jev_capable` / `needs_llm` route task and typed-decision / generative dispatch described below. The tool-requirement classifier and Ollaya tool-selection workflow are the target architecture; they are **not yet implemented by the current runtime**. This README distinguishes the intended design from the behavior that can be run today.
 
+
+
+
+
+
+
+## Table of Contents
+
+- [Routing model](#routing-model)
+  - [Target tool-routing behavior](#target-tool-routing-behavior)
+  - [Current `master` behavior](#current-master-behavior)
+- [Cascade engine](#cascade-engine)
+- [Current configuration](#current-configuration)
+- [Build and run](#build-and-run)
+  - [Prerequisites](#prerequisites)
+  - [Principal runtime settings](#principal-runtime-settings)
+- [HTTP API](#http-api)
+  - [Prompt completion](#prompt-completion)
+  - [Chat completion](#chat-completion)
+  - [Typed decision request (current compatibility path)](#typed-decision-request-current-compatibility-path)
+  - [Generic task execution](#generic-task-execution)
+  - [Request correlation](#request-correlation)
+- [Testing and validation](#testing-and-validation)
+- [Observability](#observability)
+- [Known limitations and transition work](#known-limitations-and-transition-work)
+- [Contributing](#contributing)
+- [License](#license)
+
+
+
+
+
+
+
 ## Routing model
 
 ### Target tool-routing behavior
