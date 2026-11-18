@@ -231,24 +231,7 @@ async fn evaluate_tool_requirement(
             "task.tool_requirement is not configured".into()
         ))?;
 
-    let labels = profile.labels.as_deref().unwrap_or_default();
-    if profile.output_kind != crate::pipeline::task::OutputKind::Binary
-        || labels.len() != 2
-        || !labels.iter().any(|label| label == NO_TOOL_REQUIRED)
-        || !labels.iter().any(|label| label == TOOL_REQUIRED)
-    {
-        return Err(ApiError::Unavailable(
-            "task.tool_requirement must be binary with labels no_tool_required and tool_required".into()
-        ));
-    }
-    if !matches!(
-        &profile.fallback,
-        FallbackPolicy::Label(label) if label == TOOL_REQUIRED
-    ) {
-        return Err(ApiError::Unavailable(
-            "task.tool_requirement must use fallback_label = \"tool_required\"".into()
-        ));
-    }
+    validate_tool_requirement_profile(&profile)?;
 
     if !state.policies.values().any(|by_task| by_task.contains_key(TOOL_REQUIREMENT_TASK)) {
         return Err(ApiError::Unavailable(
@@ -279,6 +262,29 @@ async fn evaluate_tool_requirement(
         "tool requirement evaluated"
     );
     Ok(payload)
+}
+
+fn validate_tool_requirement_profile(profile: &Task) -> Result<(), ApiError> {
+    let labels = profile.labels.as_deref().unwrap_or_default();
+    if profile.name != TOOL_REQUIREMENT_TASK
+        || profile.output_kind != crate::pipeline::task::OutputKind::Binary
+        || labels.len() != 2
+        || !labels.iter().any(|label| label == NO_TOOL_REQUIRED)
+        || !labels.iter().any(|label| label == TOOL_REQUIRED)
+    {
+        return Err(ApiError::Unavailable(
+            "task.tool_requirement must be binary with exactly the labels no_tool_required and tool_required".into()
+        ));
+    }
+    if !matches!(
+        &profile.fallback,
+        FallbackPolicy::Label(label) if label == TOOL_REQUIRED
+    ) {
+        return Err(ApiError::Unavailable(
+            "task.tool_requirement must use fallback_label = \\"tool_required\\"".into()
+        ));
+    }
+    Ok(())
 }
 
 fn build_tool_requirement_input(request: &ToolRequirementRequest) -> Result<String, ApiError> {
@@ -696,11 +702,24 @@ mod tests {
     }
 
     #[test]
-    fn tool_requirement_requires_conservative_fallback_configuration() {
-        let safe = FallbackPolicy::Label(TOOL_REQUIRED.into());
-        let unsafe_fallback = FallbackPolicy::Label(NO_TOOL_REQUIRED.into());
-        assert!(matches!(&safe, FallbackPolicy::Label(label) if label == TOOL_REQUIRED));
-        assert!(!matches!(&unsafe_fallback, FallbackPolicy::Label(label) if label == TOOL_REQUIRED));
+    fn tool_requirement_profile_rejects_non_conservative_fallback() {
+        let profile = Task {
+            name: TOOL_REQUIREMENT_TASK.into(),
+            cascade: Cascade::default(),
+            output_kind: OutputKind::Binary,
+            labels: Some(vec![NO_TOOL_REQUIRED.into(), TOOL_REQUIRED.into()]),
+            label_metadata: Vec::new(),
+            taxonomy_version: None,
+            fallback: FallbackPolicy::Label(TOOL_REQUIRED.into()),
+        };
+        assert!(validate_tool_requirement_profile(&profile).is_ok());
+
+        let mut unsafe_profile = profile;
+        unsafe_profile.fallback = FallbackPolicy::Label(NO_TOOL_REQUIRED.into());
+        assert!(matches!(
+            validate_tool_requirement_profile(&unsafe_profile),
+            Err(ApiError::Unavailable(_))
+        ));
     }
     use crate::pipeline::{
         cascade::{Cascade, CascadeGraph},
