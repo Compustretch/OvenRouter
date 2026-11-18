@@ -236,7 +236,8 @@ label_min_confidence = { jev_capable = 0.95, needs_llm = 0.70 }
 min_confidence = 0.85
 
 [tier_policy.encoder.tool_requirement]
-min_confidence = 0.95
+min_confidence = 0.70
+label_min_confidence = { no_tool_required = 0.95 }
 ```
 
 `config/router.toml` contains deployment settings for the legacy tier compatibility blocks and the current `decision` and `generative` terminal strategies. Provider identity and strategy identity are separate: `decision` is currently executed by Ollaya, and `generative` by Ollama. Model identifiers such as `laya:en` and `gemma3:latest` are configuration values, not strategy names.
@@ -335,7 +336,7 @@ curl -s http://127.0.0.1:8080/v1/chat/completions \
   -d '{"messages":[{"role":"user","content":"Summarize the incident report."}],"stream":false}'
 ```
 
-The current implementation rejects `stream: true`. For chat requests, it currently classifies using the latest user message, while the generative fallback receives the serialized conversation. This context mismatch is a known limitation and must be addressed as part of context-aware tool-requirement classification.
+The existing completion implementation rejects `stream: true`. Its legacy route classifier uses the latest user message, while its generative fallback receives the serialized conversation. This limitation remains in the legacy completion path; the separate `/v1/tasks/tool-requirement` endpoint accepts structured conversation history for the new tool-necessity task.
 
 ### Typed decision request (current compatibility path)
 
@@ -408,7 +409,7 @@ The request preserves the conversation, including assistant tool-call messages a
 }
 ```
 
-The current user message is placed first in a versioned `ovenrouter.tool_requirement.v1` inference envelope, followed by agent/skill/capability context and conversation history. The API accepts up to 128 messages, 16 skills, and 128 capabilities and bounds the serialized request to 64 KiB. The shared ModernBERT encoder currently truncates its tokenized input to 512 tokens, so the harness should send a compact, relevant conversation window. The 64 KiB API limit is a transport bound, not a guarantee that the entire request fits the model context.
+The versioned `ovenrouter.tool_requirement.v1` envelope uses an ordered context array: current user message first, followed by agent metadata, active skill summaries, capability descriptions, task context, and prior conversation history. The API accepts up to 128 messages, 16 skills, and 128 capabilities and bounds the serialized request to 64 KiB. The shared ModernBERT encoder currently truncates its tokenized input to 512 tokens, so the harness should send a compact, relevant conversation window. The 64 KiB API limit is a transport bound, not a guarantee that the entire request fits the model context.
 
 A model-resolved response contains the predicted label and confidence:
 
