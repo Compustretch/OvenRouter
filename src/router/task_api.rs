@@ -734,7 +734,7 @@ mod tests {
             Some(Uuid::new_v4())
         ).is_err());
         let generated = resolve_tool_requirement_request_id(&HeaderMap::new(), None).unwrap();
-        assert_ne!(generated, Uuid::nil());
+        assert_ne!(generated, Uuid::from_u128(0));
 
         headers.append("x-request-id", HeaderValue::from_static("00000000-0000-4000-8000-000000000000"));
         assert!(resolve_tool_requirement_request_id(&headers, None).is_err());
@@ -759,7 +759,7 @@ mod tests {
             resolution: Resolution::Fallback { label: TOOL_REQUIRED.into() },
             trace: Vec::new(),
         };
-        let result = tool_requirement_result(Uuid::nil(), &outcome, &CascadeGraph::default());
+        let result = tool_requirement_result(Uuid::from_u128(0), &outcome, &CascadeGraph::default());
         assert_eq!(result["task"], TOOL_REQUIREMENT_TASK);
         assert_eq!(result["decision"], TOOL_REQUIRED);
         assert_eq!(result["status"], "fallback");
