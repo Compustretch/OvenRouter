@@ -281,7 +281,7 @@ fn validate_tool_requirement_profile(profile: &Task) -> Result<(), ApiError> {
         FallbackPolicy::Label(label) if label == TOOL_REQUIRED
     ) {
         return Err(ApiError::Unavailable(
-            "task.tool_requirement must use fallback_label = \\"tool_required\\"".into()
+            "task.tool_requirement must use fallback_label = \"tool_required\"".into()
         ));
     }
     Ok(())
@@ -353,14 +353,19 @@ fn build_tool_requirement_input(request: &ToolRequirementRequest) -> Result<Stri
     // user message comes first because the encoder has a finite token window;
     // history follows it. It carries compact capability descriptions, never
     // executable tool schemas or authorization grants.
+    // JSON object key order is not a priority contract. Keep the context as
+    // an array so the current user turn is guaranteed to precede metadata and
+    // older history when the encoder applies its finite token window.
     let envelope = json!({
         "schema_version": "ovenrouter.tool_requirement.v1",
-        "current_user_message": current_user_message,
-        "agent": &request.agent,
-        "active_skills": &request.active_skills,
-        "capabilities": &request.capabilities,
-        "task_context": &request.task_context,
-        "conversation_history": conversation_history,
+        "context": [
+            {"kind": "current_user_message", "message": current_user_message},
+            {"kind": "agent", "value": &request.agent},
+            {"kind": "active_skills", "items": &request.active_skills},
+            {"kind": "capabilities", "items": &request.capabilities},
+            {"kind": "task_context", "value": &request.task_context},
+            {"kind": "conversation_history", "messages": conversation_history},
+        ],
     });
     let serialized = serde_json::to_string(&envelope)
         .map_err(|error| ApiError::Internal(format!("failed to serialize routing context: {error}")))?;
@@ -666,12 +671,13 @@ mod tests {
         let input = build_tool_requirement_input(&request).unwrap();
         let envelope: Value = serde_json::from_str(&input).unwrap();
         assert_eq!(envelope["schema_version"], "ovenrouter.tool_requirement.v1");
-        assert_eq!(envelope["agent"]["id"], "coda");
-        assert_eq!(envelope["active_skills"][0]["name"], "workload-investigation");
-        assert_eq!(envelope["capabilities"][0]["id"], "clickhouse.query");
-        assert_eq!(envelope["current_user_message"]["content"], "Now investigate that execution.");
-        assert_eq!(envelope["conversation_history"][2]["role"], "tool");
-        assert_eq!(envelope["conversation_history"][2]["content"], "run_id=42");
+        assert_eq!(envelope["context"][0]["kind"], "current_user_message");
+        assert_eq!(envelope["context"][0]["message"]["content"], "Now investigate that execution.");
+        assert_eq!(envelope["context"][1]["value"]["id"], "coda");
+        assert_eq!(envelope["context"][2]["items"][0]["name"], "workload-investigation");
+        assert_eq!(envelope["context"][3]["items"][0]["id"], "clickhouse.query");
+        assert_eq!(envelope["context"][5]["messages"][2]["role"], "tool");
+        assert_eq!(envelope["context"][5]["messages"][2]["content"], "run_id=42");
     }
 
     #[test]
