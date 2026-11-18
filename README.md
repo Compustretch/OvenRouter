@@ -34,7 +34,7 @@ side effects. Requests that don't need tools are a single completion. Deciding
 which shape applies before generation starts keeps the loop, and its
 irreversibility, off the path of requests that don't require it.
 
-> **Implementation status:** `master` is in transition. The current runtime still uses the legacy `jev_capable` / `needs_llm` route task and typed-decision / generative dispatch described below. The tool-requirement classifier and Ollaya tool-selection workflow are the target architecture; they are **not yet implemented by the current runtime**. This README distinguishes the intended design from the behavior that can be run today.
+> **Implementation status:** `master` is in transition. The existing `/v1/completions` and `/v1/chat/completions` paths still use the legacy `jev_capable` / `needs_llm` task and typed-decision / generative dispatch. A separate binary `tool_requirement` task and context-aware `POST /v1/tasks/tool-requirement` decision endpoint are implemented. A trained `tool_requirement` encoder head is still a deployment artifact; until it is installed, the configured conservative fallback returns `tool_required`. Ollaya tool selection, structured tool-call generation, and MCP execution remain future work.
 
 
 
@@ -57,6 +57,7 @@ irreversibility, off the path of requests that don't require it.
   - [Chat completion](#chat-completion)
   - [Typed decision request (current compatibility path)](#typed-decision-request-current-compatibility-path)
   - [Generic task execution](#generic-task-execution)
+  - [Tool-requirement decision](#tool-requirement-decision)
   - [Request correlation](#request-correlation)
 - [Testing and validation](#testing-and-validation)
 - [Observability](#observability)
@@ -114,19 +115,21 @@ OvenRouter coordinates the request-routing and tool-mediated execution paths. Ol
 
 A positive classifier result means **enter the tool-selection path**. It does not guarantee that a matching tool exists or that Ollaya will select one. “No applicable tool” must remain a distinct downstream outcome; it must not be silently reinterpreted as `no_tool_required` by the classifier.
 
+The `tool_requirement` task is exposed independently at `POST /v1/tasks/tool-requirement`. It accepts the conversation plus selected-agent context, active skill summaries, and compact capability descriptions. It returns a routing decision only: it does not select a tool, generate arguments, invoke a provider, or authorize an operation.
+
 The tool-selection result and the LLM-generated call are separate contracts. The selected tool should be identified by a stable tool identity. The LLM should generate arguments against the selected tool's authoritative schema; it should not independently substitute another tool. Tool execution, result handling, and any approval policy remain explicit orchestration steps. The tool interface should preserve standard MCP tool identity and input-schema semantics so the router can work with canonical MCP servers rather than depending on a server-specific tool format.
 
 An illustrative task contract for the target classifier is:
 
 ```toml
 [task.tool_requirement]
-cascade = ["rules", "fasttext", "encoder"]
+cascade = ["encoder"]
 output_kind = "binary"
 labels = ["no_tool_required", "tool_required"]
 fallback_label = "tool_required"
 ```
 
-This is the intended output contract, **not a configuration accepted by the current `master` completion path**. The current entry point still looks up the task named `route` and the legacy label constants. A conservative `tool_required` fallback favors avoiding missed tool invocations, at the cost of more calls to Ollaya; production calibration should measure that tradeoff.
+This task is configured separately from the legacy `route` task and is invoked through `/v1/tasks/tool-requirement`, not through the existing completion dispatcher. It currently uses the shared encoder tier only: the rules and FastText implementations still emit legacy Jev labels and must not be reused for this task without a task-generic head implementation. The conservative `tool_required` fallback favors avoiding missed tool invocations; its effect on unnecessary tool discovery must be measured.
 
 ### Current `master` behavior
 
@@ -183,6 +186,12 @@ cascade = ["encoder"]
 output_kind = "multiclass"
 taxonomy = "../taskonomies/help_desk.json"
 fallback = "defer"
+
+[task.tool_requirement]
+cascade = ["encoder"]
+output_kind = "binary"
+labels = ["no_tool_required", "tool_required"]
+fallback_label = "tool_required"
 ```
 
 Available tiers are declared separately. The order of `[[tier]]` declarations has no execution meaning; task cascades define the path.
@@ -225,11 +234,15 @@ label_min_confidence = { jev_capable = 0.95, needs_llm = 0.70 }
 
 [tier_policy.encoder.tag]
 min_confidence = 0.85
+
+[tier_policy.encoder.tool_requirement]
+min_confidence = 0.70
+label_min_confidence = { no_tool_required = 0.95 }
 ```
 
 `config/router.toml` contains deployment settings for the legacy tier compatibility blocks and the current `decision` and `generative` terminal strategies. Provider identity and strategy identity are separate: `decision` is currently executed by Ollaya, and `generative` by Ollama. Model identifiers such as `laya:en` and `gemma3:latest` are configuration values, not strategy names.
 
-The target tool-requirement task will replace the legacy route labels with `no_tool_required` and `tool_required`. Its fallback and calibration policy must be chosen to reflect the cost of missed tool calls versus unnecessary tool-selection attempts. The example above is the **current configuration**, not the proposed future task configuration.
+`tool_requirement` is intentionally a separate task from the legacy `route` task. The existing `/v1/completions` dispatch path remains unchanged during this transition; harnesses can call the dedicated tool-requirement endpoint independently. The checked-in configuration uses an encoder-only cascade until task-generic rule and FastText heads are available. The initial confidence bar is provisional and must be calibrated against a held-out tool-requirement dataset.
 
 ## Build and run
 
@@ -304,6 +317,7 @@ The gateway exposes the following endpoints:
 | `POST` | `/v1/chat/completions` | Chat-message completion; returns an OpenAI-style chat response |
 | `POST` | `/v1/decisions` | Compatibility alias to the completion handler |
 | `POST` | `/v1/tasks` | Run selected configured task heads |
+| `POST` | `/v1/tasks/tool-requirement` | Context-aware binary tool-necessity decision |
 | `GET` | `/v1/tasks/{run_id}` | Poll the remaining task results |
 
 ### Prompt completion
@@ -322,7 +336,7 @@ curl -s http://127.0.0.1:8080/v1/chat/completions \
   -d '{"messages":[{"role":"user","content":"Summarize the incident report."}],"stream":false}'
 ```
 
-The current implementation rejects `stream: true`. For chat requests, it currently classifies using the latest user message, while the generative fallback receives the serialized conversation. This context mismatch is a known limitation and must be addressed as part of context-aware tool-requirement classification.
+The existing completion implementation rejects `stream: true`. Its legacy route classifier uses the latest user message, while its generative fallback receives the serialized conversation. This limitation remains in the legacy completion path; the separate `/v1/tasks/tool-requirement` endpoint accepts structured conversation history for the new tool-necessity task.
 
 ### Typed decision request (current compatibility path)
 
@@ -364,6 +378,67 @@ curl -s http://127.0.0.1:8080/v1/tasks \
 
 Every task ID must correspond to a `[task.<id>]` profile in `config/tasks.toml`. `required_tasks` must be a non-empty subset of `tasks`; when omitted, all selected tasks are required. When all selected tasks are required, the endpoint returns the complete result immediately. When only a subset is required, it returns that subset with a `run_id` and `pending_tasks`; poll `GET /v1/tasks/{run_id}` for the remaining results. Polling returns HTTP `202` while the run is pending and HTTP `200` when complete. Stored task runs expire after 15 minutes.
 
+### Tool-requirement decision
+
+`POST /v1/tasks/tool-requirement` evaluates the configured binary `tool_requirement` task without invoking a generative model or downstream tool-selection strategy. An agent harness calls it before each model inference.
+
+The request preserves the conversation, including assistant tool-call messages and tool results. The harness may also send the selected agent, active skill summaries, and compact capability descriptions. Do not send executable tool schemas or treat these descriptions as authorization grants. Supply `X-Request-ID` or the JSON `request_id` field for correlation; when both are present they must match. If neither is supplied, OvenRouter generates a UUID. The response echoes the resolved ID in its `X-Request-ID` header and `request_id` field.
+
+```json
+{
+  "messages": [
+    {"role": "user", "content": "Run the workload."},
+    {"role": "assistant", "tool_calls": [{"id": "call-1", "type": "function"}]},
+    {"role": "tool", "name": "workload.run", "tool_call_id": "call-1", "content": "run_id=42"},
+    {"role": "user", "content": "Now investigate that execution."}
+  ],
+  "agent": {"id": "coda"},
+  "active_skills": [
+    {
+      "name": "workload-investigation",
+      "description": "Investigate workload execution outcomes.",
+      "summary": "Inspect execution metadata and query ClickHouse."
+    }
+  ],
+  "capabilities": [
+    {
+      "id": "clickhouse.query",
+      "description": "Run authorized analytical queries."
+    }
+  ]
+}
+```
+
+The versioned `ovenrouter.tool_requirement.v1` envelope uses an ordered context array: current user message first, followed by agent metadata, active skill summaries, capability descriptions, task context, and prior conversation history. The API accepts up to 128 messages, 16 skills, and 128 capabilities and bounds the serialized request to 64 KiB. The shared ModernBERT encoder currently truncates its tokenized input to 512 tokens, so the harness should send a compact, relevant conversation window. The 64 KiB API limit is a transport bound, not a guarantee that the entire request fits the model context.
+
+A model-resolved response contains the predicted label and confidence:
+
+```json
+{
+  "request_id": "7a4d35a2-3983-4d90-8f6d-0cbbda9a6c72",
+  "task": "tool_requirement",
+  "decision": "tool_required",
+  "status": "resolved",
+  "confidence": 0.97,
+  "scores": [
+    {"label": "no_tool_required", "score": 0.03},
+    {"label": "tool_required", "score": 0.97}
+  ],
+  "source": {
+    "tier": "encoder",
+    "tier_id": "…",
+    "model_id": "modernbert-onnx"
+  },
+  "trace": []
+}
+```
+
+The configured fallback is deliberately conservative: `tool_required`. If the encoder has no trained head for this task, the sidecar reports the task as unsupported and the router returns `status: "fallback"`, `decision: "tool_required"`, and a null confidence. The response therefore does not present a fallback as a model prediction.
+
+The head artifact belongs at `models/modernbert-base/heads/tool_requirement/head.json`. Train it from labeled JSONL examples containing `prompt` and `label` fields (`tool_required` or `no_tool_required`) using `calibration/train_heads.py` with `--task tool_requirement`, `--output-kind binary`, the shared encoder and tokenizer, and a held-out dataset for temperature calibration. The training input must use the same `ovenrouter.tool_requirement.v1` context serialization used by the endpoint. The threshold in `config/tasks.toml` is an initial conservative value, not a production calibration result.
+
+This endpoint decides **whether** to enter capability discovery. It does not select a specific capability, generate a tool call, execute MCP, or enforce permissions. The caller retains responsibility for those stages.
+
 ### Request correlation
 
 The completion endpoints accept `X-Request-ID` as a UUID header and an optional JSON `request_id` for compatibility. If both are supplied, they must match. If neither is supplied, the router generates a UUIDv4. Malformed, duplicated, or conflicting IDs receive HTTP `400`. The resolved ID is echoed in the response's `X-Request-ID` header and propagated to current downstream calls and telemetry.
@@ -400,7 +475,8 @@ Tagging writes its own local JSONL spool under `logs/` and can insert tag record
 
 ## Known limitations and transition work
 
-- The current route task still predicts `jev_capable` versus `needs_llm`; the binary tool-requirement task is not yet wired into the runtime.
+- The existing completion endpoints still predict `jev_capable` versus `needs_llm`; they have not been migrated to the binary tool-requirement decision.
+- The separate `tool_requirement` task API is implemented, but a trained encoder head must be installed before it produces model-resolved decisions; its default fallback is `tool_required`.
 - Current Ollaya integration performs typed decision evaluation and Jev-eligibility checking. It does not select tools.
 - Current generative integration uses Ollama's `/api/generate`; it does not emit structured tool calls.
 - There is no current MCP/tool executor in the completion path.
@@ -409,7 +485,7 @@ Tagging writes its own local JSONL spool under `logs/` and can insert tag record
 - The current model and threshold settings are workload-dependent. Retraining or changing a model requires recalibration and renewed evaluation.
 - Capture spools contain raw request/response content and need an explicit operational retention policy.
 
-The tool-routing implementation needs to add the binary tool-requirement task, route positive results through Ollaya tool selection, pass the selected tool schema to an LLM capable of structured tool-call generation, execute that call through the configured tool transport, and return the result to the LLM. The classifier, selector, call generator, and executor must retain distinct request/response contracts and observable outcomes.
+The remaining tool-routing implementation needs to route positive `tool_requirement` results through capability discovery and Ollaya tool selection, pass the selected tool schema to an LLM capable of structured tool-call generation, execute that call through the configured tool transport, and return the result to the LLM. The classifier, selector, call generator, and executor must retain distinct request/response contracts and observable outcomes.
 
 ## Contributing
 

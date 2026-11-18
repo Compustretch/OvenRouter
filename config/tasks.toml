@@ -17,6 +17,15 @@ output_kind = "multiclass"
 taxonomy = "../taskonomies/help_desk.json"
 fallback = "defer"
 
+# Independent binary preflight decision. The encoder head is loaded from
+# models/modernbert-base/heads/tool_requirement/head.json. Until that artifact
+# exists, the conservative fallback routes the request into tool discovery.
+[task.tool_requirement]
+cascade = ["encoder"]
+output_kind = "binary"
+labels = ["no_tool_required", "tool_required"]
+fallback_label = "tool_required"
+
 # Each [[tier]] is an available Tier definition, addressed by TierName. The
 # registry catalogs definitions; task cascades select which definitions the
 # CascadeGraph materializes as TierInstances with hash-derived TierIds.
@@ -84,3 +93,9 @@ label_min_confidence = { jev_capable = 0.95, needs_llm = 0.70 }
 # The route and tag heads share one encoder invocation through ScoreTasks.
 [tier_policy.encoder.tag]
 min_confidence = 0.85
+
+# Initial conservative bar; calibrate against held-out tool-requirement data
+# before treating this value as a production threshold.
+[tier_policy.encoder.tool_requirement]
+min_confidence = 0.70
+label_min_confidence = { no_tool_required = 0.95 }

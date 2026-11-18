@@ -12,12 +12,12 @@ use std::{
 
 use axum::{
     extract::{Path, State},
-    http::StatusCode,
+    http::{HeaderMap, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
@@ -26,7 +26,7 @@ use uuid::Uuid;
 use crate::pipeline::{
     cascade::{CascadeGraph, Slot},
     runner::{CascadeRunner, Resolution, RunOutcome, TaskOutcome},
-    task::{Decision, Task, TierPolicyMap, TierReading},
+    task::{Decision, FallbackPolicy, Task, TierPolicyMap, TierReading},
 };
 
 const RUN_TTL: Duration = Duration::from_secs(900);
@@ -46,6 +46,63 @@ struct TaskExecutionRequest {
     tasks: Vec<String>,
     #[serde(default)]
     required_tasks: Option<Vec<String>>,
+}
+
+const TOOL_REQUIREMENT_TASK: &str = "tool_requirement";
+const NO_TOOL_REQUIRED: &str = "no_tool_required";
+const TOOL_REQUIRED: &str = "tool_required";
+const MAX_TOOL_REQUIREMENT_CONTEXT_BYTES: usize = 64 * 1024;
+const MAX_TOOL_REQUIREMENT_MESSAGES: usize = 128;
+const MAX_TOOL_REQUIREMENT_SKILLS: usize = 16;
+const MAX_TOOL_REQUIREMENT_CAPABILITIES: usize = 128;
+
+#[derive(Debug, Deserialize, Serialize)]
+struct ToolRequirementRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    request_id: Option<Uuid>,
+    messages: Vec<ToolRequirementMessage>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    agent: Option<AgentContext>,
+    #[serde(default)]
+    active_skills: Vec<SkillContext>,
+    #[serde(default)]
+    capabilities: Vec<CapabilityDescriptor>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    task_context: Option<Value>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct ToolRequirementMessage {
+    role: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    content: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    tool_call_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    tool_calls: Option<Value>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct AgentContext {
+    id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    description: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct SkillContext {
+    name: String,
+    description: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    summary: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct CapabilityDescriptor {
+    id: String,
+    description: String,
 }
 
 #[derive(Clone, Default)]
@@ -107,6 +164,7 @@ impl TaskRunStore {
 #[derive(Debug)]
 enum ApiError {
     Invalid(String),
+    Unavailable(String),
     Internal(String),
 }
 
@@ -116,6 +174,10 @@ impl IntoResponse for ApiError {
             Self::Invalid(detail) => (
                 StatusCode::BAD_REQUEST,
                 Json(json!({"error": "invalid_task_request", "detail": detail})),
+            ).into_response(),
+            Self::Unavailable(detail) => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({"error": "task_unavailable", "detail": detail})),
             ).into_response(),
             Self::Internal(detail) => (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -140,8 +202,271 @@ pub fn router(
     };
     Router::new()
         .route("/", post(execute_tasks))
+        .route("/tool-requirement", post(tool_requirement))
         .route("/:run_id", get(get_task_run))
         .with_state(state)
+}
+
+async fn tool_requirement(
+    State(state): State<TaskApiState>,
+    headers: HeaderMap,
+    Json(request): Json<ToolRequirementRequest>,
+) -> Response {
+    let request_id = match resolve_tool_requirement_request_id(&headers, request.request_id) {
+        Ok(request_id) => request_id,
+        Err(error) => return error.into_response(),
+    };
+
+    let mut response = match evaluate_tool_requirement(&state, request, request_id).await {
+        Ok(payload) => (StatusCode::OK, Json(payload)).into_response(),
+        Err(error) => error.into_response(),
+    };
+    let request_id_header = HeaderValue::from_str(&request_id.to_string())
+        .expect("canonical UUID text is a valid HTTP header value");
+    response.headers_mut().insert("x-request-id", request_id_header);
+    response
+}
+
+fn resolve_tool_requirement_request_id(
+    headers: &HeaderMap,
+    body_request_id: Option<Uuid>,
+) -> Result<Uuid, ApiError> {
+    let mut values = headers.get_all("x-request-id").iter();
+    let header_value = values.next();
+    if values.next().is_some() {
+        return Err(ApiError::Invalid("X-Request-ID must be supplied at most once".into()));
+    }
+
+    let header_request_id = match header_value {
+        Some(value) => {
+            let raw = value.to_str()
+                .map_err(|_| ApiError::Invalid("X-Request-ID must contain a valid UUID".into()))?;
+            Some(Uuid::parse_str(raw)
+                .map_err(|_| ApiError::Invalid("X-Request-ID must contain a valid UUID".into()))?)
+        }
+        None => None,
+    };
+
+    match (header_request_id, body_request_id) {
+        (Some(header), Some(body)) if header != body => Err(ApiError::Invalid(
+            "X-Request-ID conflicts with JSON request_id".into()
+        )),
+        (Some(header), _) => Ok(header),
+        (None, Some(body)) => Ok(body),
+        (None, None) => Ok(Uuid::new_v4()),
+    }
+}
+
+async fn evaluate_tool_requirement(
+    state: &TaskApiState,
+    request: ToolRequirementRequest,
+    request_id: Uuid,
+) -> Result<Value, ApiError> {
+    let prompt = build_tool_requirement_input(&request)?;
+
+    let profile = state.profiles.iter()
+        .find(|profile| profile.name.as_str() == TOOL_REQUIREMENT_TASK)
+        .cloned()
+        .ok_or_else(|| ApiError::Unavailable(
+            "task.tool_requirement is not configured".into()
+        ))?;
+
+    validate_tool_requirement_profile(&profile)?;
+
+    if !state.policies.values().any(|by_task| by_task.contains_key(TOOL_REQUIREMENT_TASK)) {
+        return Err(ApiError::Unavailable(
+            "task.tool_requirement has no enabled tier policy".into()
+        ));
+    }
+
+    let started = Instant::now();
+    let outcome = state.cascade.run(
+        &prompt,
+        &[profile],
+        &state.policies,
+        state.budget,
+    ).await;
+    let task_outcome = outcome.tasks.get(TOOL_REQUIREMENT_TASK)
+        .ok_or_else(|| ApiError::Internal(
+            "tool_requirement cascade returned no task outcome".into()
+        ))?;
+
+    let payload = tool_requirement_result(request_id, task_outcome, &state.cascade.graph());
+    tracing::info!(
+        request_id = %request_id,
+        status = payload["status"].as_str().unwrap_or("unknown"),
+        decision = payload["decision"].as_str().unwrap_or("deferred"),
+        confidence = ?payload["confidence"].as_f64(),
+        tier_calls = outcome.tier_calls.len(),
+        elapsed_ms = started.elapsed().as_secs_f64() * 1000.0,
+        "tool requirement evaluated"
+    );
+    Ok(payload)
+}
+
+fn validate_tool_requirement_profile(profile: &Task) -> Result<(), ApiError> {
+    let labels = profile.labels.as_deref().unwrap_or_default();
+    if profile.name != TOOL_REQUIREMENT_TASK
+        || profile.output_kind != crate::pipeline::task::OutputKind::Binary
+        || labels.len() != 2
+        || !labels.iter().any(|label| label == NO_TOOL_REQUIRED)
+        || !labels.iter().any(|label| label == TOOL_REQUIRED)
+    {
+        return Err(ApiError::Unavailable(
+            "task.tool_requirement must be binary with exactly the labels no_tool_required and tool_required".into()
+        ));
+    }
+    if !matches!(
+        &profile.fallback,
+        FallbackPolicy::Label(label) if label == TOOL_REQUIRED
+    ) {
+        return Err(ApiError::Unavailable(
+            "task.tool_requirement must use fallback_label = \"tool_required\"".into()
+        ));
+    }
+    Ok(())
+}
+
+fn build_tool_requirement_input(request: &ToolRequirementRequest) -> Result<String, ApiError> {
+    if request.messages.is_empty() || request.messages.len() > MAX_TOOL_REQUIREMENT_MESSAGES {
+        return Err(ApiError::Invalid(format!(
+            "messages must contain between 1 and {MAX_TOOL_REQUIREMENT_MESSAGES} entries"
+        )));
+    }
+    if request.active_skills.len() > MAX_TOOL_REQUIREMENT_SKILLS {
+        return Err(ApiError::Invalid(format!(
+            "active_skills may contain at most {MAX_TOOL_REQUIREMENT_SKILLS} entries"
+        )));
+    }
+    if request.capabilities.len() > MAX_TOOL_REQUIREMENT_CAPABILITIES {
+        return Err(ApiError::Invalid(format!(
+            "capabilities may contain at most {MAX_TOOL_REQUIREMENT_CAPABILITIES} entries"
+        )));
+    }
+
+    let mut has_user_message = false;
+    for (index, message) in request.messages.iter().enumerate() {
+        if !matches!(message.role.as_str(), "system" | "developer" | "user" | "assistant" | "tool") {
+            return Err(ApiError::Invalid(format!(
+                "messages[{index}].role must be system, developer, user, assistant, or tool"
+            )));
+        }
+        has_user_message |= message.role == "user";
+        if message.content.is_none() && message.tool_calls.is_none() {
+            return Err(ApiError::Invalid(format!(
+                "messages[{index}] must include content or tool_calls"
+            )));
+        }
+    }
+    if !has_user_message {
+        return Err(ApiError::Invalid("messages must include at least one user message".into()));
+    }
+
+    if let Some(agent) = &request.agent {
+        validate_context_string(&agent.id, "agent.id", 128)?;
+        if let Some(description) = &agent.description {
+            validate_context_string(description, "agent.description", 2048)?;
+        }
+    }
+    for (index, skill) in request.active_skills.iter().enumerate() {
+        validate_context_string(&skill.name, &format!("active_skills[{index}].name"), 128)?;
+        validate_context_string(&skill.description, &format!("active_skills[{index}].description"), 2048)?;
+        if let Some(summary) = &skill.summary {
+            validate_context_string(summary, &format!("active_skills[{index}].summary"), 8192)?;
+        }
+    }
+    for (index, capability) in request.capabilities.iter().enumerate() {
+        validate_context_string(&capability.id, &format!("capabilities[{index}].id"), 256)?;
+        validate_context_string(&capability.description, &format!("capabilities[{index}].description"), 1024)?;
+    }
+
+    let current_user_index = request.messages.iter()
+        .rposition(|message| message.role == "user")
+        .expect("validated above: at least one user message");
+    let current_user_message = &request.messages[current_user_index];
+    let conversation_history: Vec<_> = request.messages.iter()
+        .enumerate()
+        .filter_map(|(index, message)| (index != current_user_index).then_some(message))
+        .collect();
+
+    // This versioned envelope is the classifier's input contract. The current
+    // user message comes first because the encoder has a finite token window;
+    // history follows it. It carries compact capability descriptions, never
+    // executable tool schemas or authorization grants.
+    // JSON object key order is not a priority contract. Keep the context as
+    // an array so the current user turn is guaranteed to precede metadata and
+    // older history when the encoder applies its finite token window.
+    let envelope = json!({
+        "schema_version": "ovenrouter.tool_requirement.v1",
+        "context": [
+            {"kind": "current_user_message", "message": current_user_message},
+            {"kind": "agent", "value": &request.agent},
+            {"kind": "active_skills", "items": &request.active_skills},
+            {"kind": "capabilities", "items": &request.capabilities},
+            {"kind": "task_context", "value": &request.task_context},
+            {"kind": "conversation_history", "messages": conversation_history},
+        ],
+    });
+    let serialized = serde_json::to_string(&envelope)
+        .map_err(|error| ApiError::Internal(format!("failed to serialize routing context: {error}")))?;
+    if serialized.len() > MAX_TOOL_REQUIREMENT_CONTEXT_BYTES {
+        return Err(ApiError::Invalid(format!(
+            "serialized routing context exceeds {MAX_TOOL_REQUIREMENT_CONTEXT_BYTES} bytes"
+        )));
+    }
+    Ok(serialized)
+}
+
+fn validate_context_string(value: &str, field: &str, max_chars: usize) -> Result<(), ApiError> {
+    if value.trim().is_empty() {
+        return Err(ApiError::Invalid(format!("{field} must not be empty")));
+    }
+    if value.chars().count() > max_chars {
+        return Err(ApiError::Invalid(format!("{field} exceeds {max_chars} characters")));
+    }
+    Ok(())
+}
+
+fn tool_requirement_result(
+    request_id: Uuid,
+    outcome: &TaskOutcome,
+    tiers: &CascadeGraph,
+) -> Value {
+    let details = task_outcome_json(outcome, tiers);
+    let resolution = &details["resolution"];
+    let (status, decision, confidence, scores, source) =
+        match resolution["kind"].as_str().unwrap_or("deferred") {
+            "tier" => (
+                "resolved",
+                resolution.get("label").cloned().unwrap_or(Value::Null),
+                resolution.get("confidence").cloned().unwrap_or(Value::Null),
+                resolution.get("scores").cloned().unwrap_or_else(|| json!([])),
+                json!({
+                    "tier": resolution.get("tier"),
+                    "tier_id": resolution.get("tier_id"),
+                    "model_id": resolution.get("model_id"),
+                }),
+            ),
+            "fallback" => (
+                "fallback",
+                resolution.get("label").cloned().unwrap_or(Value::Null),
+                Value::Null,
+                json!([]),
+                Value::Null,
+            ),
+            _ => ("deferred", Value::Null, Value::Null, json!([]), Value::Null),
+        };
+
+    json!({
+        "request_id": request_id,
+        "task": TOOL_REQUIREMENT_TASK,
+        "decision": decision,
+        "status": status,
+        "confidence": confidence,
+        "scores": scores,
+        "source": source,
+        "trace": details["trace"],
+    })
 }
 
 async fn execute_tasks(
@@ -361,6 +686,107 @@ fn task_outcome_json(outcome: &TaskOutcome, tiers: &CascadeGraph) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tool_requirement_input_preserves_conversation_skills_and_capabilities() {
+        let request: ToolRequirementRequest = serde_json::from_value(json!({
+            "messages": [
+                {"role": "user", "content": "Run the workload."},
+                {"role": "assistant", "tool_calls": [{"id": "call-1", "type": "function"}]},
+                {"role": "tool", "name": "workload.run", "tool_call_id": "call-1", "content": "run_id=42"},
+                {"role": "user", "content": "Now investigate that execution."}
+            ],
+            "agent": {"id": "coda", "description": "Coding and operations agent"},
+            "active_skills": [{
+                "name": "workload-investigation",
+                "description": "Investigate workload results",
+                "summary": "Inspect execution metadata and query ClickHouse."
+            }],
+            "capabilities": [{
+                "id": "clickhouse.query",
+                "description": "Run authorized analytical queries."
+            }]
+        })).unwrap();
+
+        let input = build_tool_requirement_input(&request).unwrap();
+        let envelope: Value = serde_json::from_str(&input).unwrap();
+        assert_eq!(envelope["schema_version"], "ovenrouter.tool_requirement.v1");
+        assert_eq!(envelope["context"][0]["kind"], "current_user_message");
+        assert_eq!(envelope["context"][0]["message"]["content"], "Now investigate that execution.");
+        assert_eq!(envelope["context"][1]["value"]["id"], "coda");
+        assert_eq!(envelope["context"][2]["items"][0]["name"], "workload-investigation");
+        assert_eq!(envelope["context"][3]["items"][0]["id"], "clickhouse.query");
+        assert_eq!(envelope["context"][5]["messages"][2]["role"], "tool");
+        assert_eq!(envelope["context"][5]["messages"][2]["content"], "run_id=42");
+    }
+
+    #[test]
+    fn tool_requirement_request_id_prefers_header_and_rejects_conflicts() {
+        let request_id = Uuid::new_v4();
+        let mut headers = HeaderMap::new();
+        headers.insert("x-request-id", HeaderValue::from_str(&request_id.to_string()).unwrap());
+        assert_eq!(
+            resolve_tool_requirement_request_id(&headers, None).unwrap(),
+            request_id
+        );
+        assert!(resolve_tool_requirement_request_id(
+            &headers,
+            Some(Uuid::new_v4())
+        ).is_err());
+        let generated = resolve_tool_requirement_request_id(&HeaderMap::new(), None).unwrap();
+        assert_ne!(generated, Uuid::from_u128(0));
+
+        headers.append("x-request-id", HeaderValue::from_static("00000000-0000-4000-8000-000000000000"));
+        assert!(resolve_tool_requirement_request_id(&headers, None).is_err());
+    }
+
+    #[test]
+    fn tool_requirement_input_rejects_missing_user_context_and_invalid_roles() {
+        let no_user: ToolRequirementRequest = serde_json::from_value(json!({
+            "messages": [{"role": "assistant", "content": "Hello"}]
+        })).unwrap();
+        assert!(build_tool_requirement_input(&no_user).is_err());
+
+        let invalid_role: ToolRequirementRequest = serde_json::from_value(json!({
+            "messages": [{"role": "function", "content": "result"}, {"role": "user", "content": "Hi"}]
+        })).unwrap();
+        assert!(build_tool_requirement_input(&invalid_role).is_err());
+    }
+
+    #[test]
+    fn tool_requirement_fallback_is_explicit_and_has_no_model_confidence() {
+        let outcome = TaskOutcome {
+            resolution: Resolution::Fallback { label: TOOL_REQUIRED.into() },
+            trace: Vec::new(),
+        };
+        let result = tool_requirement_result(Uuid::from_u128(0), &outcome, &CascadeGraph::default());
+        assert_eq!(result["task"], TOOL_REQUIREMENT_TASK);
+        assert_eq!(result["decision"], TOOL_REQUIRED);
+        assert_eq!(result["status"], "fallback");
+        assert!(result["confidence"].is_null());
+        assert_eq!(result["source"], Value::Null);
+    }
+
+    #[test]
+    fn tool_requirement_profile_rejects_non_conservative_fallback() {
+        let profile = Task {
+            name: TOOL_REQUIREMENT_TASK.into(),
+            cascade: Cascade::default(),
+            output_kind: OutputKind::Binary,
+            labels: Some(vec![NO_TOOL_REQUIRED.into(), TOOL_REQUIRED.into()]),
+            label_metadata: Vec::new(),
+            taxonomy_version: None,
+            fallback: FallbackPolicy::Label(TOOL_REQUIRED.into()),
+        };
+        assert!(validate_tool_requirement_profile(&profile).is_ok());
+
+        let mut unsafe_profile = profile;
+        unsafe_profile.fallback = FallbackPolicy::Label(NO_TOOL_REQUIRED.into());
+        assert!(matches!(
+            validate_tool_requirement_profile(&unsafe_profile),
+            Err(ApiError::Unavailable(_))
+        ));
+    }
     use crate::pipeline::{
         cascade::{Cascade, CascadeGraph},
         registry::TierRegistry,
@@ -402,6 +828,75 @@ mod tests {
             taxonomy_version: None,
             fallback: FallbackPolicy::Defer,
         }
+    }
+
+    #[tokio::test]
+    async fn tool_requirement_endpoint_runs_only_the_configured_task_head() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let encoder = Arc::new(FixtureTier {
+            name: "encoder".into(),
+            delay: Duration::ZERO,
+            readings: [(
+                TOOL_REQUIREMENT_TASK.into(),
+                TierReading::Scored(Reading::new(TOOL_REQUIRED, 0.97)),
+            )].into(),
+            calls: calls.clone(),
+        });
+        let registry = TierRegistry::of(vec![
+            fake_entry("encoder", Strategy::Encoder, encoder),
+        ]);
+
+        let mut task = profile(
+            TOOL_REQUIREMENT_TASK,
+            OutputKind::Binary,
+            &[NO_TOOL_REQUIRED, TOOL_REQUIRED],
+            &["encoder"],
+        );
+        task.fallback = FallbackPolicy::Label(TOOL_REQUIRED.into());
+
+        let graph = CascadeGraph::from_tasks(&[task.clone()], &registry).unwrap();
+        let encoder_id = graph.id_for_name(&tname("encoder")).unwrap();
+        let policies: TierPolicyMap = [(
+            encoder_id,
+            [(
+                TOOL_REQUIREMENT_TASK.into(),
+                TierPolicy::new(0.70).with_label(NO_TOOL_REQUIRED, 0.95),
+            )].into(),
+        )].into();
+
+        let state = TaskApiState {
+            cascade: Arc::new(CascadeRunner::new(graph)),
+            profiles: vec![task],
+            policies: Arc::new(policies),
+            budget: Duration::from_secs(1),
+            runs: TaskRunStore::default(),
+        };
+        let request: ToolRequirementRequest = serde_json::from_value(json!({
+            "messages": [{"role": "user", "content": "Check the workload execution."}],
+            "agent": {"id": "coda"},
+            "active_skills": [{
+                "name": "workload-investigation",
+                "description": "Investigate a workload execution."
+            }],
+            "capabilities": [{
+                "id": "clickhouse.query",
+                "description": "Query workload execution telemetry."
+            }]
+        })).unwrap();
+
+        let request_id = Uuid::new_v4();
+        let result = evaluate_tool_requirement(&state, request, request_id).await.unwrap();
+
+        assert_eq!(result["request_id"], request_id.to_string());
+        assert_eq!(result["task"], TOOL_REQUIREMENT_TASK);
+        assert_eq!(result["decision"], TOOL_REQUIRED);
+        assert_eq!(result["status"], "resolved");
+        assert_eq!(result["confidence"], 0.97);
+        assert_eq!(result["source"]["tier"], "encoder");
+        assert_eq!(
+            calls.lock().unwrap().as_slice(),
+            &[("encoder".into(), vec![TOOL_REQUIREMENT_TASK.into()])]
+        );
     }
 
     fn fake_entry(
