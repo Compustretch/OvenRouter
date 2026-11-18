@@ -123,13 +123,13 @@ An illustrative task contract for the target classifier is:
 
 ```toml
 [task.tool_requirement]
-cascade = ["rules", "fasttext", "encoder"]
+cascade = ["encoder"]
 output_kind = "binary"
 labels = ["no_tool_required", "tool_required"]
 fallback_label = "tool_required"
 ```
 
-This is the intended output contract, **not a configuration accepted by the current `master` completion path**. The current entry point still looks up the task named `route` and the legacy label constants. A conservative `tool_required` fallback favors avoiding missed tool invocations, at the cost of more calls to Ollaya; production calibration should measure that tradeoff.
+This task is configured separately from the legacy `route` task and is invoked through `/v1/tasks/tool-requirement`, not through the existing completion dispatcher. It currently uses the shared encoder tier only: the rules and FastText implementations still emit legacy Jev labels and must not be reused for this task without a task-generic head implementation. The conservative `tool_required` fallback favors avoiding missed tool invocations; its effect on unnecessary tool discovery must be measured.
 
 ### Current `master` behavior
 
@@ -234,11 +234,14 @@ label_min_confidence = { jev_capable = 0.95, needs_llm = 0.70 }
 
 [tier_policy.encoder.tag]
 min_confidence = 0.85
+
+[tier_policy.encoder.tool_requirement]
+min_confidence = 0.95
 ```
 
 `config/router.toml` contains deployment settings for the legacy tier compatibility blocks and the current `decision` and `generative` terminal strategies. Provider identity and strategy identity are separate: `decision` is currently executed by Ollaya, and `generative` by Ollama. Model identifiers such as `laya:en` and `gemma3:latest` are configuration values, not strategy names.
 
-The target tool-requirement task will replace the legacy route labels with `no_tool_required` and `tool_required`. Its fallback and calibration policy must be chosen to reflect the cost of missed tool calls versus unnecessary tool-selection attempts. The example above is the **current configuration**, not the proposed future task configuration.
+`tool_requirement` is intentionally a separate task from the legacy `route` task. The existing `/v1/completions` dispatch path remains unchanged during this transition; harnesses can call the dedicated tool-requirement endpoint independently. The checked-in configuration uses an encoder-only cascade until task-generic rule and FastText heads are available. The initial confidence bar is provisional and must be calibrated against a held-out tool-requirement dataset.
 
 ## Build and run
 
@@ -432,66 +435,6 @@ A model-resolved response contains the predicted label and confidence:
 The configured fallback is deliberately conservative: `tool_required`. If the encoder has no trained head for this task, the sidecar reports the task as unsupported and the router returns `status: "fallback"`, `decision: "tool_required"`, and a null confidence. The response therefore does not present a fallback as a model prediction.
 
 The head artifact belongs at `models/modernbert-base/heads/tool_requirement/head.json`. Train it from labeled JSONL examples containing `prompt` and `label` fields (`tool_required` or `no_tool_required`) using `calibration/train_heads.py` with `--task tool_requirement`, `--output-kind binary`, the shared encoder and tokenizer, and a held-out dataset for temperature calibration. The training input must use the same `ovenrouter.tool_requirement.v1` context serialization used by the endpoint. The threshold in `config/tasks.toml` is an initial conservative value, not a production calibration result.
-
-This endpoint decides **whether** to enter capability discovery. It does not select a specific capability, generate a tool call, execute MCP, or enforce permissions. The caller retains responsibility for those stages.
-
-### Tool-requirement decision
-
-`POST /v1/tasks/tool-requirement` evaluates the configured binary `tool_requirement` task without invoking a generative model or downstream tool-selection strategy. An agent harness calls it before each model inference.
-
-The request preserves the conversation, including assistant tool-call messages and tool results. The harness may also send the selected agent, active skill summaries, and compact capability descriptions. Do not send executable tool schemas or treat these descriptions as authorization grants.
-
-```json
-{
-  "messages": [
-    {"role": "user", "content": "Run the workload and investigate the result."},
-    {"role": "assistant", "tool_calls": [{"id": "call-1", "type": "function"}]},
-    {"role": "tool", "name": "workload.run", "tool_call_id": "call-1", "content": "run_id=42"}
-  ],
-  "agent": {"id": "coda"},
-  "active_skills": [
-    {
-      "name": "workload-investigation",
-      "description": "Investigate workload execution outcomes.",
-      "summary": "Inspect execution metadata and query ClickHouse."
-    }
-  ],
-  "capabilities": [
-    {
-      "id": "clickhouse.query",
-      "description": "Run authorized analytical queries."
-    }
-  ]
-}
-```
-
-The request is serialized into a versioned `ovenrouter.tool_requirement.v1` inference envelope. The API validates message roles and bounds the serialized context to 64 KiB. The classifier receives capability descriptions, not tool schemas.
-
-A model-resolved response contains the predicted label and confidence:
-
-```json
-{
-  "request_id": "7a4d35a2-3983-4d90-8f6d-0cbbda9a6c72",
-  "task": "tool_requirement",
-  "decision": "tool_required",
-  "status": "resolved",
-  "confidence": 0.97,
-  "scores": [
-    {"label": "no_tool_required", "score": 0.03},
-    {"label": "tool_required", "score": 0.97}
-  ],
-  "source": {
-    "tier": "encoder",
-    "tier_id": "…",
-    "model_id": "modernbert-onnx"
-  },
-  "trace": []
-}
-```
-
-The configured fallback is deliberately conservative: `tool_required`. If the encoder has no trained head for this task, the sidecar reports the task as unsupported and the router returns `status: "fallback"`, `decision: "tool_required"`, and a null confidence. The response therefore does not present a fallback as a model prediction.
-
-The head artifact belongs at `models/modernbert-base/heads/tool_requirement/head.json`. Train it from labeled examples using `calibration/train_heads.py` with `--task tool_requirement`, `--output-kind binary`, the shared encoder and tokenizer, and a held-out dataset for temperature calibration. The threshold in `config/tasks.toml` is an initial conservative value, not a production calibration result.
 
 This endpoint decides **whether** to enter capability discovery. It does not select a specific capability, generate a tool call, execute MCP, or enforce permissions. The caller retains responsibility for those stages.
 
