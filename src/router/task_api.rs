@@ -225,7 +225,7 @@ async fn evaluate_tool_requirement(
     let prompt = build_tool_requirement_input(&request)?;
 
     let profile = state.profiles.iter()
-        .find(|profile| profile.name == TOOL_REQUIREMENT_TASK)
+        .find(|profile| profile.name.as_str() == TOOL_REQUIREMENT_TASK)
         .cloned()
         .ok_or_else(|| ApiError::Unavailable(
             "task.tool_requirement is not configured".into()
@@ -265,7 +265,7 @@ async fn evaluate_tool_requirement(
         request_id = %request_id,
         status = payload["status"].as_str().unwrap_or("unknown"),
         decision = payload["decision"].as_str().unwrap_or("deferred"),
-        confidence = payload["confidence"].as_f64().unwrap_or(0.0),
+        confidence = ?payload["confidence"].as_f64(),
         tier_calls = outcome.tier_calls.len(),
         elapsed_ms = started.elapsed().as_secs_f64() * 1000.0,
         "tool requirement evaluated"
@@ -326,16 +326,27 @@ fn build_tool_requirement_input(request: &ToolRequirementRequest) -> Result<Stri
         validate_context_string(&capability.description, &format!("capabilities[{index}].description"), 1024)?;
     }
 
-    // This versioned envelope is the classifier's input contract. It carries
-    // conversation/tool-result context and compact capability descriptions,
-    // never executable tool schemas or authorization grants.
+    let current_user_index = request.messages.iter()
+        .rposition(|message| message.role == "user")
+        .expect("validated above: at least one user message");
+    let current_user_message = &request.messages[current_user_index];
+    let conversation_history: Vec<_> = request.messages.iter()
+        .enumerate()
+        .filter_map(|(index, message)| (index != current_user_index).then_some(message))
+        .collect();
+
+    // This versioned envelope is the classifier's input contract. The current
+    // user message comes first because the encoder has a finite token window;
+    // history follows it. It carries compact capability descriptions, never
+    // executable tool schemas or authorization grants.
     let envelope = json!({
         "schema_version": "ovenrouter.tool_requirement.v1",
-        "agent": request.agent,
-        "active_skills": request.active_skills,
-        "capabilities": request.capabilities,
-        "task_context": request.task_context,
-        "messages": request.messages,
+        "current_user_message": current_user_message,
+        "agent": &request.agent,
+        "active_skills": &request.active_skills,
+        "capabilities": &request.capabilities,
+        "task_context": &request.task_context,
+        "conversation_history": conversation_history,
     });
     let serialized = serde_json::to_string(&envelope)
         .map_err(|error| ApiError::Internal(format!("failed to serialize routing context: {error}")))?;
