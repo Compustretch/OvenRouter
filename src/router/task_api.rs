@@ -830,6 +830,75 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn tool_requirement_endpoint_runs_only_the_configured_task_head() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let encoder = Arc::new(FixtureTier {
+            name: "encoder".into(),
+            delay: Duration::ZERO,
+            readings: [(
+                TOOL_REQUIREMENT_TASK.into(),
+                TierReading::Scored(Reading::new(TOOL_REQUIRED, 0.97)),
+            )].into(),
+            calls: calls.clone(),
+        });
+        let registry = TierRegistry::of(vec![
+            fake_entry("encoder", Strategy::Encoder, encoder),
+        ]);
+
+        let mut task = profile(
+            TOOL_REQUIREMENT_TASK,
+            OutputKind::Binary,
+            &[NO_TOOL_REQUIRED, TOOL_REQUIRED],
+            &["encoder"],
+        );
+        task.fallback = FallbackPolicy::Label(TOOL_REQUIRED.into());
+
+        let graph = CascadeGraph::from_tasks(&[task.clone()], &registry).unwrap();
+        let encoder_id = graph.id_for_name(&tname("encoder")).unwrap();
+        let policies: TierPolicyMap = [(
+            encoder_id,
+            [(
+                TOOL_REQUIREMENT_TASK.into(),
+                TierPolicy::new(0.70).with_label(NO_TOOL_REQUIRED, 0.95),
+            )].into(),
+        )].into();
+
+        let state = TaskApiState {
+            cascade: Arc::new(CascadeRunner::new(graph)),
+            profiles: vec![task],
+            policies: Arc::new(policies),
+            budget: Duration::from_secs(1),
+            runs: TaskRunStore::default(),
+        };
+        let request: ToolRequirementRequest = serde_json::from_value(json!({
+            "messages": [{"role": "user", "content": "Check the workload execution."}],
+            "agent": {"id": "coda"},
+            "active_skills": [{
+                "name": "workload-investigation",
+                "description": "Investigate a workload execution."
+            }],
+            "capabilities": [{
+                "id": "clickhouse.query",
+                "description": "Query workload execution telemetry."
+            }]
+        })).unwrap();
+
+        let request_id = Uuid::new_v4();
+        let result = evaluate_tool_requirement(&state, request, request_id).await.unwrap();
+
+        assert_eq!(result["request_id"], request_id.to_string());
+        assert_eq!(result["task"], TOOL_REQUIREMENT_TASK);
+        assert_eq!(result["decision"], TOOL_REQUIRED);
+        assert_eq!(result["status"], "resolved");
+        assert_eq!(result["confidence"], 0.97);
+        assert_eq!(result["source"]["tier"], "encoder");
+        assert_eq!(
+            calls.lock().unwrap().as_slice(),
+            &[("encoder".into(), vec![TOOL_REQUIREMENT_TASK.into()])]
+        );
+    }
+
     fn fake_entry(
         name: &str,
         strategy: Strategy,
