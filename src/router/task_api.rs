@@ -634,7 +634,8 @@ mod tests {
             "messages": [
                 {"role": "user", "content": "Run the workload."},
                 {"role": "assistant", "tool_calls": [{"id": "call-1", "type": "function"}]},
-                {"role": "tool", "name": "workload.run", "tool_call_id": "call-1", "content": "run_id=42"}
+                {"role": "tool", "name": "workload.run", "tool_call_id": "call-1", "content": "run_id=42"},
+                {"role": "user", "content": "Now investigate that execution."}
             ],
             "agent": {"id": "coda", "description": "Coding and operations agent"},
             "active_skills": [{
@@ -654,8 +655,9 @@ mod tests {
         assert_eq!(envelope["agent"]["id"], "coda");
         assert_eq!(envelope["active_skills"][0]["name"], "workload-investigation");
         assert_eq!(envelope["capabilities"][0]["id"], "clickhouse.query");
-        assert_eq!(envelope["messages"][2]["role"], "tool");
-        assert_eq!(envelope["messages"][2]["content"], "run_id=42");
+        assert_eq!(envelope["current_user_message"]["content"], "Now investigate that execution.");
+        assert_eq!(envelope["conversation_history"][2]["role"], "tool");
+        assert_eq!(envelope["conversation_history"][2]["content"], "run_id=42");
     }
 
     #[test]
