@@ -12,7 +12,7 @@ use std::{
 
 use axum::{
     extract::{Path, State},
-    http::StatusCode,
+    http::{HeaderMap, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
@@ -209,19 +209,59 @@ pub fn router(
 
 async fn tool_requirement(
     State(state): State<TaskApiState>,
+    headers: HeaderMap,
     Json(request): Json<ToolRequirementRequest>,
 ) -> Response {
-    match evaluate_tool_requirement(&state, request).await {
+    let request_id = match resolve_tool_requirement_request_id(&headers, request.request_id) {
+        Ok(request_id) => request_id,
+        Err(error) => return error.into_response(),
+    };
+
+    let mut response = match evaluate_tool_requirement(&state, request, request_id).await {
         Ok(payload) => (StatusCode::OK, Json(payload)).into_response(),
         Err(error) => error.into_response(),
+    };
+    let request_id_header = HeaderValue::from_str(&request_id.to_string())
+        .expect("canonical UUID text is a valid HTTP header value");
+    response.headers_mut().insert("x-request-id", request_id_header);
+    response
+}
+
+fn resolve_tool_requirement_request_id(
+    headers: &HeaderMap,
+    body_request_id: Option<Uuid>,
+) -> Result<Uuid, ApiError> {
+    let mut values = headers.get_all("x-request-id").iter();
+    let header_value = values.next();
+    if values.next().is_some() {
+        return Err(ApiError::Invalid("X-Request-ID must be supplied at most once".into()));
+    }
+
+    let header_request_id = match header_value {
+        Some(value) => {
+            let raw = value.to_str()
+                .map_err(|_| ApiError::Invalid("X-Request-ID must contain a valid UUID".into()))?;
+            Some(Uuid::parse_str(raw)
+                .map_err(|_| ApiError::Invalid("X-Request-ID must contain a valid UUID".into()))?)
+        }
+        None => None,
+    };
+
+    match (header_request_id, body_request_id) {
+        (Some(header), Some(body)) if header != body => Err(ApiError::Invalid(
+            "X-Request-ID conflicts with JSON request_id".into()
+        )),
+        (Some(header), _) => Ok(header),
+        (None, Some(body)) => Ok(body),
+        (None, None) => Ok(Uuid::new_v4()),
     }
 }
 
 async fn evaluate_tool_requirement(
     state: &TaskApiState,
     request: ToolRequirementRequest,
+    request_id: Uuid,
 ) -> Result<Value, ApiError> {
-    let request_id = request.request_id.unwrap_or_else(Uuid::new_v4);
     let prompt = build_tool_requirement_input(&request)?;
 
     let profile = state.profiles.iter()
@@ -678,6 +718,25 @@ mod tests {
         assert_eq!(envelope["context"][3]["items"][0]["id"], "clickhouse.query");
         assert_eq!(envelope["context"][5]["messages"][2]["role"], "tool");
         assert_eq!(envelope["context"][5]["messages"][2]["content"], "run_id=42");
+    }
+
+    #[test]
+    fn tool_requirement_request_id_prefers_header_and_rejects_conflicts() {
+        let request_id = Uuid::new_v4();
+        let mut headers = HeaderMap::new();
+        headers.insert("x-request-id", HeaderValue::from_str(&request_id.to_string()).unwrap());
+        assert_eq!(
+            resolve_tool_requirement_request_id(&headers, None).unwrap(),
+            request_id
+        );
+        assert!(resolve_tool_requirement_request_id(
+            &headers,
+            Some(Uuid::new_v4())
+        ).is_err());
+        assert_eq!(
+            resolve_tool_requirement_request_id(&HeaderMap::new(), None).unwrap().get_version_num(),
+            4
+        );
     }
 
     #[test]
