@@ -382,7 +382,7 @@ Every task ID must correspond to a `[task.<id>]` profile in `config/tasks.toml`.
 
 `POST /v1/tasks/tool-requirement` evaluates the configured binary `tool_requirement` task without invoking a generative model or downstream tool-selection strategy. An agent harness calls it before each model inference.
 
-The request preserves the conversation, including assistant tool-call messages and tool results. The harness may also send the selected agent, active skill summaries, and compact capability descriptions. Do not send executable tool schemas or treat these descriptions as authorization grants.
+The request preserves the conversation, including assistant tool-call messages and tool results. The harness may also send the selected agent, active skill summaries, and compact capability descriptions. Do not send executable tool schemas or treat these descriptions as authorization grants. Supply `X-Request-ID` or the JSON `request_id` field for correlation; when both are present they must match. If neither is supplied, OvenRouter generates a UUID. The response echoes the resolved ID in its `X-Request-ID` header and `request_id` field.
 
 ```json
 {
