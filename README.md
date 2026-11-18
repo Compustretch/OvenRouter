@@ -383,6 +383,67 @@ The request preserves the conversation, including assistant tool-call messages a
 ```json
 {
   "messages": [
+    {"role": "user", "content": "Run the workload."},
+    {"role": "assistant", "tool_calls": [{"id": "call-1", "type": "function"}]},
+    {"role": "tool", "name": "workload.run", "tool_call_id": "call-1", "content": "run_id=42"},
+    {"role": "user", "content": "Now investigate that execution."}
+  ],
+  "agent": {"id": "coda"},
+  "active_skills": [
+    {
+      "name": "workload-investigation",
+      "description": "Investigate workload execution outcomes.",
+      "summary": "Inspect execution metadata and query ClickHouse."
+    }
+  ],
+  "capabilities": [
+    {
+      "id": "clickhouse.query",
+      "description": "Run authorized analytical queries."
+    }
+  ]
+}
+```
+
+The current user message is placed first in a versioned `ovenrouter.tool_requirement.v1` inference envelope, followed by agent/skill/capability context and conversation history. The API accepts up to 128 messages, 16 skills, and 128 capabilities and bounds the serialized request to 64 KiB. The shared ModernBERT encoder currently truncates its tokenized input to 512 tokens, so the harness should send a compact, relevant conversation window. The 64 KiB API limit is a transport bound, not a guarantee that the entire request fits the model context.
+
+A model-resolved response contains the predicted label and confidence:
+
+```json
+{
+  "request_id": "7a4d35a2-3983-4d90-8f6d-0cbbda9a6c72",
+  "task": "tool_requirement",
+  "decision": "tool_required",
+  "status": "resolved",
+  "confidence": 0.97,
+  "scores": [
+    {"label": "no_tool_required", "score": 0.03},
+    {"label": "tool_required", "score": 0.97}
+  ],
+  "source": {
+    "tier": "encoder",
+    "tier_id": "…",
+    "model_id": "modernbert-onnx"
+  },
+  "trace": []
+}
+```
+
+The configured fallback is deliberately conservative: `tool_required`. If the encoder has no trained head for this task, the sidecar reports the task as unsupported and the router returns `status: "fallback"`, `decision: "tool_required"`, and a null confidence. The response therefore does not present a fallback as a model prediction.
+
+The head artifact belongs at `models/modernbert-base/heads/tool_requirement/head.json`. Train it from labeled JSONL examples containing `prompt` and `label` fields (`tool_required` or `no_tool_required`) using `calibration/train_heads.py` with `--task tool_requirement`, `--output-kind binary`, the shared encoder and tokenizer, and a held-out dataset for temperature calibration. The training input must use the same `ovenrouter.tool_requirement.v1` context serialization used by the endpoint. The threshold in `config/tasks.toml` is an initial conservative value, not a production calibration result.
+
+This endpoint decides **whether** to enter capability discovery. It does not select a specific capability, generate a tool call, execute MCP, or enforce permissions. The caller retains responsibility for those stages.
+
+### Tool-requirement decision
+
+`POST /v1/tasks/tool-requirement` evaluates the configured binary `tool_requirement` task without invoking a generative model or downstream tool-selection strategy. An agent harness calls it before each model inference.
+
+The request preserves the conversation, including assistant tool-call messages and tool results. The harness may also send the selected agent, active skill summaries, and compact capability descriptions. Do not send executable tool schemas or treat these descriptions as authorization grants.
+
+```json
+{
+  "messages": [
     {"role": "user", "content": "Run the workload and investigate the result."},
     {"role": "assistant", "tool_calls": [{"id": "call-1", "type": "function"}]},
     {"role": "tool", "name": "workload.run", "tool_call_id": "call-1", "content": "run_id=42"}
