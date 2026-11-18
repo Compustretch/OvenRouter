@@ -26,7 +26,7 @@ use uuid::Uuid;
 use crate::pipeline::{
     cascade::{CascadeGraph, Slot},
     runner::{CascadeRunner, Resolution, RunOutcome, TaskOutcome},
-    task::{Decision, Task, TierPolicyMap, TierReading},
+    task::{Decision, FallbackPolicy, Task, TierPolicyMap, TierReading},
 };
 
 const RUN_TTL: Duration = Duration::from_secs(900);
@@ -239,6 +239,14 @@ async fn evaluate_tool_requirement(
     {
         return Err(ApiError::Unavailable(
             "task.tool_requirement must be binary with labels no_tool_required and tool_required".into()
+        ));
+    }
+    if !matches!(
+        &profile.fallback,
+        FallbackPolicy::Label(label) if label == TOOL_REQUIRED
+    ) {
+        return Err(ApiError::Unavailable(
+            "task.tool_requirement must use fallback_label = \"tool_required\"".into()
         ));
     }
 
@@ -685,6 +693,14 @@ mod tests {
         assert_eq!(result["status"], "fallback");
         assert!(result["confidence"].is_null());
         assert_eq!(result["source"], Value::Null);
+    }
+
+    #[test]
+    fn tool_requirement_requires_conservative_fallback_configuration() {
+        let safe = FallbackPolicy::Label(TOOL_REQUIRED.into());
+        let unsafe_fallback = FallbackPolicy::Label(NO_TOOL_REQUIRED.into());
+        assert!(matches!(&safe, FallbackPolicy::Label(label) if label == TOOL_REQUIRED));
+        assert!(!matches!(&unsafe_fallback, FallbackPolicy::Label(label) if label == TOOL_REQUIRED));
     }
     use crate::pipeline::{
         cascade::{Cascade, CascadeGraph},
