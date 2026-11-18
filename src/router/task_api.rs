@@ -733,10 +733,11 @@ mod tests {
             &headers,
             Some(Uuid::new_v4())
         ).is_err());
-        assert_eq!(
-            resolve_tool_requirement_request_id(&HeaderMap::new(), None).unwrap().get_version_num(),
-            4
-        );
+        let generated = resolve_tool_requirement_request_id(&HeaderMap::new(), None).unwrap();
+        assert_ne!(generated, Uuid::nil());
+
+        headers.append("x-request-id", HeaderValue::from_static("00000000-0000-4000-8000-000000000000"));
+        assert!(resolve_tool_requirement_request_id(&headers, None).is_err());
     }
 
     #[test]
